@@ -1,0 +1,8 @@
+Example Commercial License
+
+This is placeholder license text. Replace this file with the full legal text
+from the actual license that allows commercial use in a for-profit game.
+
+Make sure to review the real license terms yourself or with legal counsel.
+The assetlib tool only enforces the 'commercialAllowed' flag and does not
+interpret or validate the legal text.

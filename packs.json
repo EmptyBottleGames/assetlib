@@ -1,33 +1,4 @@
 // Content is an example at the moment. Replace with actual packs later.
 [
-  {
-    "id": "fab_scifi_soldier_pro_pack",
-    "name": "Sci-Fi Soldier Pro Pack",
-    "source": "Fab",
-    "cloud_url": "https://drive.google.com/drive/folders/EXAMPLE_SOLDIER",
-    "categories": ["assets", "animations", "systems"],
-    "tags": ["sci-fi", "character", "soldier", "weapons"],
-    "notes": "High-quality sci-fi soldier with meshes, anims, and sample blueprints.",
-    "license": "Fab_personal"
-  },
-  {
-    "id": "fab_desert_ruins_01",
-    "name": "Desert Ruins Environment Pack",
-    "source": "Fab",
-    "cloud_url": "https://drive.google.com/drive/folders/EXAMPLE_DESERT",
-    "categories": ["assets"],
-    "tags": ["environment", "desert", "ruins"],
-    "notes": "Modular desert ruins environment. Good for TPS/FPS maps.",
-    "license": "Fab_personal"
-  },
-  {
-    "id": "fab_muzzle_flash_vfx_01",
-    "name": "Muzzle Flash VFX Pack",
-    "source": "Fab",
-    "cloud_url": "https://drive.google.com/drive/folders/EXAMPLE_MUZZLE",
-    "categories": ["vfx"],
-    "tags": ["vfx", "weapons", "muzzle", "niagara"],
-    "notes": "Includes Niagara systems, textures, and sample materials.",
-    "license": "Fab_personal"
-  }
+  
 ]
