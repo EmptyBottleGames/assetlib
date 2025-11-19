@@ -29,18 +29,16 @@ Functions follow PowerShell-approved verb–noun patterns internally (e.g. `Get-
 2. Clone this repo:
 
    ```powershell
-   cd C:\Dev   # or wherever you keep repos
-   git clone https://github.com/<your-username>/assetlib.git
+   cd C:\Users\user\projects   # or wherever you keep repos
+   # git cli
+   git clone https://github.com/EmptyBottleGames/assetlib.git
+   # or gh cli
+   gh repo clone EmptyBottleGames/assetlib
+   # finally
    cd assetlib
    ```
 
-3. (Maybe once) allow local scripts to run in PowerShell:
-
-   ```powershell
-   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-   ```
-
-4. Run the installer script:
+3. Run the installer script:
 
    ```powershell
    .\Install-AssetLib.ps1
@@ -53,7 +51,13 @@ Functions follow PowerShell-approved verb–noun patterns internally (e.g. `Get-
 
    This value is saved to `assetlib.config.json` and is used when `assetlib add` offers to open the asset store in your browser.
 
-5. Close PowerShell and open a new PowerShell window.
+   - **If the install command fails try running:**
+
+   ```powershell
+   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+   ```
+
+4. Close PowerShell and open a new PowerShell window.
 
 Now you can use the `assetlib` command from **any folder**.
 

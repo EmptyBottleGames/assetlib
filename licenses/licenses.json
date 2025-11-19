@@ -1,2 +1,9 @@
 [
+  {
+    "id": "Fab_Standard_License",
+    "name": "Fab Standard License",
+    "description": "The standard license used by Fab. Full details can be found at https://www.fab.com/eula.",
+    "file": "Fab_Standard_License.txt",
+    "commercialAllowed": true
+  }
 ]

@@ -1,4 +1,10 @@
-// Content is an example at the moment. Replace with actual packs later.
-[
-  
-]
+{
+  "id": "Mco_Mocap_Basics",
+  "name": "MCO Mocap Basics",
+  "source": "Fab",
+  "cloud_url": "https://drive.google.com/drive/folders/1Nnx8on35Pk1Wy7koElMylaflvBTK2B7j?usp=drive_link",
+  "categories": "animations",
+  "tags": "mocap",
+  "notes": "",
+  "licenseId": "Fab_Standard_License"
+}
