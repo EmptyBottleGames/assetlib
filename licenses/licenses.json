@@ -5,5 +5,12 @@
     "description": "The standard license used by Fab. Full details can be found at https://www.fab.com/eula.",
     "file": "Fab_Standard_License.txt",
     "commercialAllowed": true
+  },
+  {
+    "id": "Creative_Commons_Attribution_4",
+    "name": "Creative Commons Attribution 4.0",
+    "description": "The creative commons attribution license. Full details can be found at https://creativecommons.org/licenses/by/4.0/.",
+    "file": "Creative_Commons_Attribution_4.txt",
+    "commercialAllowed": true
   }
 ]

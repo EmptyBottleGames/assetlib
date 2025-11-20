@@ -245,7 +245,7 @@ function Add-AssetPack {
 
     $cloudUrl = Read-Host "Google Drive folder URL"
 
-    $catsRaw = Read-Host "categories (comma-separated: assets, animations, vfx, systems)"
+    $catsRaw = Read-Host "categories (comma-separated: assets, animations, vfx, systems, plugins, etc.)"
     $categories = @()
     if ($catsRaw) {
         $categories = $catsRaw.Split(",") |
