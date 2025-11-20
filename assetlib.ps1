@@ -477,6 +477,7 @@ function Add-AssetPack {
         Write-Error "id is required."
         return
     }
+    
     if ($packs | Where-Object { $_.id -eq $id }) {
         Write-Error "A pack with id '$id' already exists."
         return
