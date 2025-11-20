@@ -1,5 +1,7 @@
 # Default: treat all files as text and normalize to LF
 * text=auto eol=lf
+*.txt text eol=lf
+
 
 # Common binary types
 *.png  binary
