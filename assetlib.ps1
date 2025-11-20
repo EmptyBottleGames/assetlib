@@ -177,6 +177,71 @@ function Get-AssetPackLicenseStatus {
 
 # endregion --------------------------------------------------------------------
 
+# region: Misc helpers ---------------------------------------------------------
+
+# Convert common Google Drive URLs into a direct-download link suitable for
+# Invoke-WebRequest. This lets you paste the normal "Get link" URL from Drive.
+#
+# Supported patterns:
+#   - https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
+#   - https://drive.google.com/open?id=<FILE_ID>
+#   - Anything already starting with https://drive.google.com/uc?...
+#
+# For unsupported or non-Drive URLs, the original value is returned.
+# This keeps the function safe for other hosts (e.g. S3, itch.io, etc.).
+#
+# Docs for [regex] in PowerShell:
+#   https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_regular_expressions
+function Convert-ToGoogleDriveDirectDownloadUrl {
+    param(
+        [string]$Url
+    )
+
+    if (-not $Url) {
+        return $null
+    }
+
+    # Already a direct-download link? Keep as-is.
+    if ($Url -match '^https://drive\.google\.com/uc\?') {
+        return $Url
+    }
+
+    # Warn if it looks like a FOLDER url - those won't work as archive_url.
+    if ($Url -match '^https://drive\.google\.com/drive/folders/') {
+        Write-Warning "The provided URL looks like a Google Drive FOLDER link. archive_url should point to a ZIP FILE, not a folder."
+        # We still return the original so the caller can decide what to do.
+        return $Url
+    }
+
+    # Pattern 1: https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
+    $fileMatch = [regex]::Match($Url, 'https://drive\.google\.com/file/d/([^/]+)')
+    if ($fileMatch.Success) {
+        $fileId = $fileMatch.Groups[1].Value
+        if ($fileId) {
+            return "https://drive.google.com/uc?export=download&id=$fileId"
+        }
+    }
+
+    # Pattern 2: ...id=<FILE_ID> in the query string (open?id=... or similar)
+    $idIndex = $Url.IndexOf('id=')
+    if ($idIndex -ge 0) {
+        $idPart = $Url.Substring($idIndex + 3)
+        $ampIndex = $idPart.IndexOf('&')
+        if ($ampIndex -ge 0) {
+            $idPart = $idPart.Substring(0, $ampIndex)
+        }
+        if ($idPart) {
+            return "https://drive.google.com/uc?export=download&id=$idPart"
+        }
+    }
+
+    # Fallback: not a recognized Drive file URL - just return original.
+    return $Url
+}
+
+
+# endregion --------------------------------------------------------------------
+
 # region: Unreal project helpers ----------------------------------------------
 
 # Detect if Unreal Editor is running.
@@ -394,6 +459,8 @@ function Get-AssetLicense {
 # Interactive add flow for a new pack:
 # - offers to open the asset store root (from config) in browser
 # - collects fields for the pack
+# - automatically converts Google Drive file URLs into direct-download URLs
+#   for archive_url (uc?export=download&id=...)
 # - enforces license rules based on licenseMode
 function Add-AssetPack {
     $packs = Get-AssetPackManifest
@@ -434,7 +501,27 @@ function Add-AssetPack {
 
     $cloudUrl = Read-Host "Google Drive folder URL (cloud_url)"
 
-    $archiveUrl = Read-Host "Direct download archive URL (archive_url, optional for now but required for install)"
+    # archive_url handling:
+    # We allow the user to paste either:
+    #   - a full Drive FILE URL (e.g. 'file/d/<id>/view?usp=sharing'), or
+    #   - a prebuilt direct download URL, or
+    #   - any other host URL (S3, itch.io, etc.).
+    #
+    # If it looks like a Google Drive file URL, we convert it to the direct
+    # download form for you so you don't have to manually extract FILE_ID.
+    $archiveUrlRaw = Read-Host "Direct download archive URL or Drive FILE URL (archive_url, optional)"
+    $archiveUrl = $null
+    if ($archiveUrlRaw) {
+        $archiveUrl = Convert-ToGoogleDriveDirectDownloadUrl -Url $archiveUrlRaw
+        if ($archiveUrl -ne $archiveUrlRaw) {
+            Write-Host "Converted Google Drive URL to direct download form:" -ForegroundColor Cyan
+            Write-Host "  $archiveUrl"
+        }
+        else {
+            Write-Host "archive_url stored as:" -ForegroundColor Cyan
+            Write-Host "  $archiveUrl"
+        }
+    }
 
     $catsRaw = Read-Host "categories (comma-separated: assets, animations, vfx, systems, plugin, etc.)"
     $categories = @()
@@ -534,6 +621,7 @@ function Add-AssetPack {
     Write-Host "Added pack $id with license '$licenseId' in mode '$licenseMode'." -ForegroundColor Green
 }
 
+
 # Remove a pack by id from the manifest only; does NOT delete Google Drive or project files.
 function Remove-AssetPack {
     param(
@@ -582,14 +670,7 @@ function Install-AssetPack {
         return
     }
 
-    $packs = Get-AssetPackManifest
-    $pack = $packs | Where-Object { $_.id -eq $Id }
-    if (-not $pack) {
-        Write-Error "No pack found with id: $Id"
-        return
-    }
-
-    # Prevent installing while Unreal Editor is running unless -Force is used
+    # Editor safety: don't install while Unreal Editor is running unless -Force is used.
     if (Test-UnrealEditorRunning) {
         if (-not $Force) {
             Write-Error "Unreal Editor appears to be running. Close the editor before installing a pack, or run again with -Force to override."
@@ -598,6 +679,13 @@ function Install-AssetPack {
         else {
             Write-Warning "Unreal Editor appears to be running. Forcing installation anyway."
         }
+    }
+
+    $packs = Get-AssetPackManifest
+    $pack = $packs | Where-Object { $_.id -eq $Id }
+    if (-not $pack) {
+        Write-Error "No pack found with id: $Id"
+        return
     }
 
     $licenses = Get-AssetLicenseManifest
@@ -650,10 +738,12 @@ function Install-AssetPack {
     }
 
     $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_" + $Id + "_" + [System.Guid]::NewGuid().ToString() + ".zip")
+    $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_extract_" + $Id + "_" + [System.Guid]::NewGuid().ToString())
 
     try {
         Write-Host "Downloading archive for '$Id' from $($pack.archive_url)..."
-        # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/invoke-webrequest
+        # Docs: Invoke-WebRequest
+        # https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/invoke-webrequest
         Invoke-WebRequest -Uri $pack.archive_url -OutFile $tempFile -UseBasicParsing
     }
     catch {
@@ -664,22 +754,129 @@ function Install-AssetPack {
         return
     }
 
+    # Before extracting, sanity-check that the file looks like a ZIP.
+    # ZIP files typically start with the bytes 'PK' (0x50 0x4B).
+    # We use System.IO.File APIs here so it works on both Windows PowerShell and PowerShell 7+.
     try {
-        Write-Host "Extracting archive to '$targetPath'..."
-        # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.archive/expand-archive
-        Expand-Archive -Path $tempFile -DestinationPath $targetPath -Force
+        $headerBytes = New-Object byte[] 4
+
+        # Docs: System.IO.File.OpenRead
+        # https://learn.microsoft.com/dotnet/api/system.io.file.openread
+        $fs = [System.IO.File]::OpenRead($tempFile)
+        try {
+            $read = $fs.Read($headerBytes, 0, $headerBytes.Length)
+        }
+        finally {
+            $fs.Dispose()
+        }
     }
     catch {
-        Write-Error "Failed to extract archive to '$targetPath': $($_.Exception.Message)"
+        Write-Error "Downloaded file could not be read from '$tempFile': $($_.Exception.Message)"
         return
     }
+
+    if ($read -lt 2 -or
+        $headerBytes[0] -ne 0x50 -or $headerBytes[1] -ne 0x4B) {
+
+        # Keep a copy of what we downloaded so you can inspect it.
+        $debugCopy = Join-Path $projectRoot ("assetlib_failed_download_" + $Id + ".bin")
+        Copy-Item -LiteralPath $tempFile -Destination $debugCopy -Force
+
+        Write-Error @"
+Downloaded file for pack '$Id' does not look like a ZIP archive.
+This often means Google Drive returned an HTML page (login/confirm) instead of the file.
+
+Saved the raw downloaded file to:
+  $debugCopy
+
+Check this file in a browser or text editor to see what Drive is returning.
+Verify that:
+  - The Drive file itself is actually a .zip
+  - Sharing is set to 'Anyone with the link can view'
+  - The archive_url in packs.json uses a FILE id, not a FOLDER url.
+"@
+        return
+    }
+
+
+    try {
+        Write-Host "Extracting archive to temporary folder '$tempExtract'..."
+        # Docs: Expand-Archive
+        # https://learn.microsoft.com/powershell/module/microsoft.powershell.archive/expand-archive
+        Expand-Archive -Path $tempFile -DestinationPath $tempExtract -Force
+    }
+    catch {
+        # Keep a copy of the downloaded file for debugging on extraction errors.
+        $debugCopy = Join-Path $projectRoot ("assetlib_failed_extract_" + $Id + ".zip")
+        Copy-Item -LiteralPath $tempFile -Destination $debugCopy -Force
+
+        Write-Error @"
+Failed to extract archive for '$Id' into temporary folder '$tempExtract': $($_.Exception.Message)
+
+A copy of the downloaded file was saved to:
+  $debugCopy
+
+Try opening that file with 7-Zip or Explorer to confirm it is a valid ZIP archive.
+If it is not, double-check the archive_url in packs.json and the Drive sharing settings.
+"@
+        return
+    }
+
+    try {
+        # Now we inspect the extracted structure to avoid double-nesting like:
+        #   Content\AssetLib\<id>\<id>\<content>
+        #
+        # Strategy:
+        #   - If the temp extract root contains exactly ONE top-level directory
+        #     and NO files, treat that directory as a wrapper folder and move
+        #     its CONTENTS into targetPath (flattening).
+        #   - Otherwise, move everything from the temp extract root into targetPath.
+        #
+        # This means typical "zipped a folder" archives behave nicely without
+        # forcing you to zip at the exact project-relative structure.
+
+        $topEntries = Get-ChildItem -Path $tempExtract
+        $topDirs = $topEntries | Where-Object { $_.PSIsContainer }
+        $topFiles = $topEntries | Where-Object { -not $_.PSIsContainer }
+
+        # Ensure targetPath exists before moving content.
+        if (-not (Test-Path $targetPath)) {
+            New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+        }
+
+        if ($topDirs.Count -eq 1 -and $topFiles.Count -eq 0) {
+            # Single wrapper directory case: flatten it.
+            $wrapperDir = $topDirs[0]
+            Write-Host "Detected single top-level folder '$($wrapperDir.Name)' in archive. Flattening into '$targetPath' to avoid double nesting..."
+
+            Get-ChildItem -Path $wrapperDir.FullName | ForEach-Object {
+                $dest = Join-Path $targetPath $_.Name
+                Move-Item -LiteralPath $_.FullName -Destination $dest -Force
+            }
+        }
+        else {
+            # Mixed files/folders or multiple top-level entries: move them all as-is.
+            Write-Host "Archive has multiple top-level entries or files; copying structure into '$targetPath'..."
+            Get-ChildItem -Path $tempExtract | ForEach-Object {
+                $dest = Join-Path $targetPath $_.Name
+                Move-Item -LiteralPath $_.FullName -Destination $dest -Force
+            }
+        }
+
+        Write-Host "Installed pack '$Id' to '$targetPath' (licenseMode=$licenseMode)." -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed while moving extracted content into '$targetPath': $($_.Exception.Message)"
+    }
     finally {
+        # Clean up temp locations if they exist.
         if (Test-Path $tempFile) {
             Remove-Item $tempFile -Force
         }
+        if (Test-Path $tempExtract) {
+            Remove-Item $tempExtract -Recurse -Force
+        }
     }
-
-    Write-Host "Installed pack '$Id' to '$targetPath' (licenseMode=$licenseMode)." -ForegroundColor Green
 }
 
 # Uninstall a pack from the current Unreal project root.
