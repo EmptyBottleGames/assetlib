@@ -461,6 +461,7 @@ function Get-AssetLicense {
 # - collects fields for the pack
 # - automatically converts Google Drive file URLs into direct-download URLs
 #   for archive_url (uc?export=download&id=...)
+# - adds optional engineVersion metadata (e.g. "5.3")
 # - enforces license rules based on licenseMode
 function Add-AssetPack {
     $packs = Get-AssetPackManifest
@@ -477,7 +478,6 @@ function Add-AssetPack {
         Write-Error "id is required."
         return
     }
-    
     if ($packs | Where-Object { $_.id -eq $id }) {
         Write-Error "A pack with id '$id' already exists."
         return
@@ -524,7 +524,7 @@ function Add-AssetPack {
         }
     }
 
-    $catsRaw = Read-Host "categories (comma-separated: assets, animations, vfx, systems, plugin, etc.)"
+    $catsRaw = Read-Host "categories (comma-separated: assets, animations, vfx, systems, tools, etc.)"
     $categories = @()
     if ($catsRaw) {
         $categories = $catsRaw.Split(",") |
@@ -541,6 +541,10 @@ function Add-AssetPack {
     }
 
     $notes = Read-Host "notes (optional)"
+
+    # Optional engine version metadata:
+    # Example: "5.3", "5.4", etc. Used for soft compatibility warnings on install.
+    $engineVersion = Read-Host "engine version this pack/plugin was built/tested against (optional, e.g. 5.3)"
 
     Write-Host ""
     Write-Host "Available licenses:" -ForegroundColor Cyan
@@ -615,6 +619,7 @@ function Add-AssetPack {
         licenseId        = $licenseId
         packType         = $packType
         pluginFolderName = $pluginFolderName
+        engineVersion    = $engineVersion
     }
 
     $packs += $newPack
@@ -658,6 +663,16 @@ function Remove-AssetPack {
 
 # Install a pack into the current Unreal project root.
 # Downloads archive_url and extracts into the appropriate folder based on packType.
+# Features:
+#   - License-mode enforcement (restrictive/permissive)
+#   - Unreal project detection (uproject + Content/)
+#   - Editor safety: blocks while Unreal Editor is running unless -Force
+#   - Engine-version awareness for plugins (+ -Force override)
+#   - C++ plugin vs Blueprint-only project warning
+#   - Engine-style plugin archive detection: BLOCKED COMPLETELY
+#   - ZIP validation (header check)
+#   - Streaming download with progress bar (HttpClient + Write-Progress)
+#   - Flattening of single top-level folder in zip to avoid double nesting
 function Install-AssetPack {
     param(
         [Parameter(Mandatory = $true)]
@@ -712,6 +727,41 @@ function Install-AssetPack {
         return
     }
 
+    # Detect project engine version and whether it has C++ modules.
+    $projectEngineVersionString = $null
+    $projectEngineMajor = $null
+    $projectEngineMinor = $null
+    $projectHasCppModules = $false
+    $uprojectPath = $null
+
+    try {
+        $uprojectFiles = Get-ChildItem -Path $projectRoot -Filter *.uproject
+        if ($uprojectFiles.Count -ge 1) {
+            # If multiple, just take the first; typical project has one.
+            $uprojectPath = $uprojectFiles[0].FullName
+            $uprojectJson = Get-Content $uprojectPath -Raw | ConvertFrom-Json
+
+            $association = $uprojectJson.EngineVersion
+            if (-not $association) {
+                $association = $uprojectJson.EngineAssociation
+            }
+            if ($association) {
+                $projectEngineVersionString = "$association"
+                if ($association -match '^(\d+)\.(\d+)') {
+                    $projectEngineMajor = [int]$Matches[1]
+                    $projectEngineMinor = [int]$Matches[2]
+                }
+            }
+
+            if ($uprojectJson.Modules -and $uprojectJson.Modules.Count -gt 0) {
+                $projectHasCppModules = $true
+            }
+        }
+    }
+    catch {
+        Write-Warning "Could not read or parse .uproject for engine version; engine compatibility checks may be limited. Error: $($_.Exception.Message)"
+    }
+
     $targetPath = Get-AssetPackInstallPath -Pack $pack -ProjectRoot $projectRoot
 
     # Safety check: ensure targetPath is under projectRoot
@@ -741,11 +791,52 @@ function Install-AssetPack {
     $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_" + $Id + "_" + [System.Guid]::NewGuid().ToString() + ".zip")
     $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_extract_" + $Id + "_" + [System.Guid]::NewGuid().ToString())
 
+    # --- Streaming download with progress bar using HttpClient ----------------
     try {
         Write-Host "Downloading archive for '$Id' from $($pack.archive_url)..."
-        # Docs: Invoke-WebRequest
-        # https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/invoke-webrequest
-        Invoke-WebRequest -Uri $pack.archive_url -OutFile $tempFile -UseBasicParsing
+
+        # Docs: System.Net.Http.HttpClient
+        # https://learn.microsoft.com/dotnet/api/system.net.http.httpclient
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $true
+        $client = [System.Net.Http.HttpClient]::new($handler)
+        $response = $client.GetAsync($pack.archive_url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+
+        if (-not $response.IsSuccessStatusCode) {
+            throw "HTTP $([int]$response.StatusCode) - $($response.ReasonPhrase)"
+        }
+
+        $contentLength = $response.Content.Headers.ContentLength
+        $inStream = $response.Content.ReadAsStream()
+        $outStream = [System.IO.File]::Open($tempFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+
+        try {
+            $buffer = New-Object byte[] 8192
+            $totalRead = 0L
+            $read = 0
+
+            do {
+                $read = $inStream.Read($buffer, 0, $buffer.Length)
+                if ($read -gt 0) {
+                    $outStream.Write($buffer, 0, $read)
+                    $totalRead += $read
+
+                    if ($contentLength -and $contentLength -gt 0) {
+                        $percent = [int](($totalRead * 100) / $contentLength)
+                        # Docs: Write-Progress
+                        # https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/write-progress
+                        Write-Progress -Activity "Downloading $Id" -Status "$percent% complete" -PercentComplete $percent
+                    }
+                }
+            } while ($read -gt 0)
+
+            Write-Progress -Activity "Downloading $Id" -Completed
+        }
+        finally {
+            if ($outStream) { $outStream.Dispose() }
+            if ($inStream) { $inStream.Dispose() }
+            if ($client) { $client.Dispose() }
+        }
     }
     catch {
         Write-Error "Failed to download archive from '$($pack.archive_url)': $($_.Exception.Message)"
@@ -757,12 +848,9 @@ function Install-AssetPack {
 
     # Before extracting, sanity-check that the file looks like a ZIP.
     # ZIP files typically start with the bytes 'PK' (0x50 0x4B).
-    # We use System.IO.File APIs here so it works on both Windows PowerShell and PowerShell 7+.
+    # Use System.IO.File APIs so this works on both Windows PowerShell and PowerShell 7+.
     try {
         $headerBytes = New-Object byte[] 4
-
-        # Docs: System.IO.File.OpenRead
-        # https://learn.microsoft.com/dotnet/api/system.io.file.openread
         $fs = [System.IO.File]::OpenRead($tempFile)
         try {
             $read = $fs.Read($headerBytes, 0, $headerBytes.Length)
@@ -799,7 +887,6 @@ Verify that:
         return
     }
 
-
     try {
         Write-Host "Extracting archive to temporary folder '$tempExtract'..."
         # Docs: Expand-Archive
@@ -824,6 +911,147 @@ If it is not, double-check the archive_url in packs.json and the Drive sharing s
     }
 
     try {
+        # Plugin-specific metadata checks (engine version, C++ modules, engine-level distribution)
+        $pluginEngineVersionString = $null
+        $pluginEngineMajor = $null
+        $pluginEngineMinor = $null
+        $pluginHasCppModules = $false
+        $pluginIsEngineStylePackage = $false
+
+        if ($pack.packType -eq 'plugin') {
+            $upluginFiles = Get-ChildItem -Path $tempExtract -Recurse -Filter *.uplugin
+            if (-not $upluginFiles -or $upluginFiles.Count -eq 0) {
+                Write-Error "Pack '$Id' is marked as plugin but the archive does not contain a .uplugin file. Cannot install as plugin."
+                return
+            }
+
+            $upluginFile = $upluginFiles[0]
+            $relativeUpluginPath = $upluginFile.FullName.Substring($tempExtract.Length).TrimStart('\', '/')
+            if ($relativeUpluginPath -like '*Engine/Plugins*' -or $relativeUpluginPath -like '*Engine\Plugins*') {
+                $pluginIsEngineStylePackage = $true
+            }
+
+            try {
+                $upluginJson = Get-Content $upluginFile.FullName -Raw | ConvertFrom-Json
+            }
+            catch {
+                Write-Warning "Could not parse plugin descriptor '$($upluginFile.FullName)'; plugin metadata checks may be limited. Error: $($_.Exception.Message)"
+                $upluginJson = $null
+            }
+
+            if ($upluginJson) {
+                # Show some basic metadata for visibility.
+                Write-Host "Plugin descriptor:" -ForegroundColor Cyan
+                Write-Host "  Name:        $($upluginJson.FriendlyName)"
+                Write-Host "  VersionName: $($upluginJson.VersionName)"
+                Write-Host "  Description: $($upluginJson.Description)"
+
+                if ($upluginJson.EngineVersion) {
+                    $pluginEngineVersionString = "$($upluginJson.EngineVersion)"
+                    if ($pluginEngineVersionString -match '^(\d+)\.(\d+)') {
+                        $pluginEngineMajor = [int]$Matches[1]
+                        $pluginEngineMinor = [int]$Matches[2]
+                    }
+                }
+
+                if ($upluginJson.Modules -and $upluginJson.Modules.Count -gt 0) {
+                    $pluginHasCppModules = $true
+                }
+            }
+
+            # HARD BLOCK: engine-style plugin packages are not supported by assetlib.
+            if ($pluginIsEngineStylePackage) {
+                Write-Warning @"
+The plugin archive for '$Id' appears to be structured as an Engine-level plugin
+(it contains an 'Engine/Plugins' path). assetlib does not support installing
+engine-level plugins at all.
+
+Engine-level plugins can impact ALL projects using that engine and usually
+require manual installation into Engine/Plugins with elevated permissions.
+"@
+
+                $choice = Read-Host "Choose action: [K]eep in manifest only, [R]emove from manifest [K]"
+                if (-not $choice -or $choice -match '^[Kk]') {
+                    Write-Error "Install aborted. Pack '$Id' remains in packs.json for tracking only. Install it into Engine/Plugins manually if needed."
+                    return
+                }
+                elseif ($choice -match '^[Rr]') {
+                    $currentPacks = Get-AssetPackManifest
+                    $remaining = $currentPacks | Where-Object { $_.id -ne $Id }
+
+                    if ($remaining.Count -lt $currentPacks.Count) {
+                        Set-AssetPackManifest -Packs $remaining
+                        Write-Host "Pack '$Id' has been removed from packs.json because it appears to be an engine-level plugin package." -ForegroundColor Yellow
+                    }
+                    else {
+                        Write-Warning "Pack '$Id' was not found in the current manifest when attempting removal."
+                    }
+
+                    Write-Error "Install aborted. Engine-level plugin package '$Id' was removed from the manifest."
+                    return
+                }
+                else {
+                    Write-Error "Install aborted. Pack '$Id' remains in packs.json for tracking only."
+                    return
+                }
+            }
+
+            # Engine version compatibility check for plugins
+            if ($projectEngineMajor -ne $null -and $pluginEngineMajor -ne $null) {
+                if ($pluginEngineMajor -ne $projectEngineMajor) {
+                    $msg = "Plugin '$Id' targets engine major version $pluginEngineMajor (from .uplugin) but the project appears to use $projectEngineMajor.x."
+                    if (-not $Force) {
+                        Write-Error "$msg Install blocked. Use -Force to override if you know this plugin is compatible."
+                        return
+                    }
+                    else {
+                        Write-Warning "$msg Proceeding due to -Force; plugin may not be compatible."
+                    }
+                }
+                elseif ($pluginEngineMinor -gt $projectEngineMinor) {
+                    $msg = "Plugin '$Id' targets engine $pluginEngineMajor.$pluginEngineMinor, which is NEWER than the project engine $projectEngineMajor.$projectEngineMinor."
+                    if (-not $Force) {
+                        Write-Error "$msg Install blocked. Use -Force if you understand the risk."
+                        return
+                    }
+                    else {
+                        Write-Warning "$msg Proceeding due to -Force; plugin may rely on features not present in this engine version."
+                    }
+                }
+                elseif ($pluginEngineMinor -lt $projectEngineMinor) {
+                    $msg = "Plugin '$Id' targets engine $pluginEngineMajor.$pluginEngineMinor, which is OLDER than the project engine $projectEngineMajor.$projectEngineMinor."
+                    if (-not $Force) {
+                        Write-Error "$msg Install blocked by default. Re-run with -Force if you want to try it anyway (many plugins do work on newer minor versions)."
+                        return
+                    }
+                    else {
+                        Write-Warning "$msg Proceeding due to -Force; test the plugin thoroughly."
+                    }
+                }
+            }
+
+            # Warn if plugin has C++ modules but project appears to be Blueprint-only.
+            if ($pluginHasCppModules -and -not $projectHasCppModules) {
+                Write-Warning @"
+Plugin '$Id' contains C++ modules, but the project appears to be Blueprint-only
+(no 'Modules' array in the .uproject). Unreal may require converting this project
+to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work.
+"@
+            }
+        }
+
+        # Soft engineVersion checks for content packs (and plugin pack engineVersion tag).
+        if ($pack.engineVersion -and $projectEngineMajor -ne $null) {
+            if ($pack.engineVersion -match '^(\d+)\.(\d+)') {
+                $packMajor = [int]$Matches[1]
+                $packMinor = [int]$Matches[2]
+
+                if ($packMajor -ne $projectEngineMajor -or $packMinor -ne $projectEngineMinor) {
+                    Write-Warning "Pack '$Id' was tagged for engine $packMajor.$packMinor but the project appears to use $projectEngineMajor.$projectEngineMinor. Content often works across minor versions, but test carefully."
+                }
+            }
+        }
+
         # Now we inspect the extracted structure to avoid double-nesting like:
         #   Content\AssetLib\<id>\<id>\<content>
         #
@@ -832,9 +1060,6 @@ If it is not, double-check the archive_url in packs.json and the Drive sharing s
         #     and NO files, treat that directory as a wrapper folder and move
         #     its CONTENTS into targetPath (flattening).
         #   - Otherwise, move everything from the temp extract root into targetPath.
-        #
-        # This means typical "zipped a folder" archives behave nicely without
-        # forcing you to zip at the exact project-relative structure.
 
         $topEntries = Get-ChildItem -Path $tempExtract
         $topDirs = $topEntries | Where-Object { $_.PSIsContainer }
@@ -867,7 +1092,7 @@ If it is not, double-check the archive_url in packs.json and the Drive sharing s
         Write-Host "Installed pack '$Id' to '$targetPath' (licenseMode=$licenseMode)." -ForegroundColor Green
     }
     catch {
-        Write-Error "Failed while moving extracted content into '$targetPath': $($_.Exception.Message)"
+        Write-Error "Failed while moving or processing extracted content for '$Id' into '$targetPath': $($_.Exception.Message)"
     }
     finally {
         # Clean up temp locations if they exist.
@@ -1357,7 +1582,7 @@ Usage:
 
 Description:
   Installs a pack into the current Unreal project root by:
-    - Downloading archive_url from packs.json
+    - Downloading archive_url from packs.json (with a progress bar)
     - Extracting it into:
         packType = content :  Content/AssetLib/<id>/
         packType = plugin  :  Plugins/<pluginFolderName or id>/
@@ -1376,6 +1601,40 @@ License behavior:
   - licenseMode = permissive:
       - Installs anything but warns on NON-COMMERCIAL/UNKNOWN/NO-LICENSE.
 
+Engine compatibility:
+  - For plugins (packType=plugin):
+      - The .uplugin file is inspected for EngineVersion.
+      - The .uproject is inspected for EngineVersion / EngineAssociation.
+      - Major-version mismatch (e.g. plugin 4.x vs project 5.x):
+          - INSTALL IS BLOCKED by default; -Force is required to override.
+      - Plugin newer than project (5.4 plugin on 5.3 project):
+          - INSTALL IS BLOCKED by default; -Force is required.
+      - Plugin older than project (5.2 plugin on 5.3 project):
+          - INSTALL IS BLOCKED by default; -Force is required, with a warning that
+            many plugins do work across minor upgrades but must be tested.
+
+  - For content packs (packType=content):
+      - Optional engineVersion metadata in packs.json (e.g. "5.3") is used for
+        soft warnings if it does not match the project engine. Content is often
+        portable across minor versions, so installs are not blocked.
+
+C++ vs Blueprint-only projects:
+  - If a plugin has C++ modules (Modules array in .uplugin) and the .uproject
+    has no Modules (Blueprint-only project), assetlib prints a warning that
+    the project may need to be converted to C++ (e.g. by adding a C++ class)
+    for the plugin to fully work.
+
+Engine-level plugins:
+  - Some plugin zips are structured for Engine-level install, containing paths
+    like 'Engine/Plugins/...'.
+  - assetlib DOES NOT SUPPORT engine-level plugin installs at all.
+      - When such a package is detected:
+          - The install is hard-blocked (no -Force override).
+          - You are prompted to:
+              - Keep the pack in packs.json for tracking only, or
+              - Remove the pack from packs.json entirely.
+      - If you need such a plugin, install it manually into Engine/Plugins.
+
 Editor safety:
   - If Unreal Editor is running:
       - Without -Force: install is blocked and you are asked to close the editor.
@@ -1388,8 +1647,32 @@ Overwrite behavior:
           - You are prompted before removing the existing folder.
       - With -Force:
           - Existing folder is removed without prompting.
+
+ZIP handling & structure:
+  - The download is validated as a ZIP (checks for 'PK' header).
+  - Archives are extracted to a temporary folder first.
+  - If the archive contains exactly one top-level folder and no files, that
+    folder is treated as a wrapper and its CONTENTS are moved into the final
+    target path to avoid double-nesting:
+      Content/AssetLib/<id>/<id>/<content> -> Content/AssetLib/<id>/<content>
+  - Otherwise, all top-level entries in the archive are moved into the target
+    path as-is.
+
+Progress:
+  - The download step uses a streaming HTTP client and Write-Progress to show
+    a progress bar in the terminal as bytes are downloaded.
+
+Relevant docs:
+  Invoke-WebRequest / HttpClient:
+    https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/invoke-webrequest
+    https://learn.microsoft.com/dotnet/api/system.net.http.httpclient
+  Expand-Archive:
+    https://learn.microsoft.com/powershell/module/microsoft.powershell.archive/expand-archive
+  Write-Progress:
+    https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/write-progress
 "@ | Write-Host
         }
+
 
         # ---------------------------------------------------------------------
         "uninstall" {
