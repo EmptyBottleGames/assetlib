@@ -1,12 +1,26 @@
 param(
     # First positional argument: which subcommand the user wants to run.
     # We restrict this to a known list using ValidateSet so typos error early.
-    # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_parameters
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("help", "list", "show", "open", "add", "remove", "licenses", "audit", "install", "uninstall", "mode")]
+    [ValidateSet(
+        "help",
+        "list",
+        "show",
+        "open",
+        "add",
+        "remove",
+        "licenses",
+        "audit",
+        "install",
+        "validate",
+        "uninstall",
+        "mode",
+        "status",
+        "cache"
+    )]
     [string]$Command,
 
-    # Many commands optionally take an Id (pack id or license id).
+    # Many commands optionally take an Id (pack id or license id, or subcommand).
     [Parameter(Position = 1)]
     [string]$Id,
 
@@ -14,14 +28,14 @@ param(
     [string]$Category,
     [string]$Tag,
 
-    # For `assetlib audit -Prune`
+    # Global flags used by several commands
+    [switch]$Force,
+    [switch]$Preview,
+    [switch]$All,
+    [switch]$Deep,
     [switch]$Prune,
-
-    # For `assetlib audit -Prune -Licenses <ids>`
-    [string[]]$Licenses,
-
-    # For destructive operations (`install`, `uninstall`, `remove`, `audit -Prune`)
-    [switch]$Force
+    [string[]]$PruneStatus,
+    [switch]$DryRun
 )
 
 # Stop execution on any non-terminating error so we can catch problems early.
@@ -31,11 +45,13 @@ $ErrorActionPreference = "Stop"
 # Paths for our core data files, resolved relative to this script's folder.
 # $PSScriptRoot is the directory containing this script.
 # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_automatic_variables
-$manifestPath = Join-Path $PSScriptRoot "packs.json"
+$manifestPath        = Join-Path $PSScriptRoot "packs.json"
 $licenseManifestPath = Join-Path $PSScriptRoot "licenses\licenses.json"
-$configPath = Join-Path $PSScriptRoot "assetlib.config.json"
+$configPath          = Join-Path $PSScriptRoot "assetlib.config.json"
 
-# region: Config handling ------------------------------------------------------
+#==============================================================================
+# region: Config handling
+#==============================================================================
 
 # Load configuration from assetlib.config.json.
 # Currently supports:
@@ -44,9 +60,11 @@ $configPath = Join-Path $PSScriptRoot "assetlib.config.json"
 function Get-AssetLibConfig {
     if (Test-Path $configPath) {
         try {
-            $json = Get-Content $configPath -Raw  # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.management/get-content
+            # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.management/get-content
+            $json = Get-Content $configPath -Raw
             if ($json.Trim()) {
-                $config = $json | ConvertFrom-Json # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/convertfrom-json
+                # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/convertfrom-json
+                $config = $json | ConvertFrom-Json
 
                 # Ensure licenseMode property exists; default to "restrictive" to be safe.
                 if (-not $config.PSObject.Properties.Name -contains 'licenseMode' -or -not $config.licenseMode) {
@@ -75,10 +93,10 @@ function Set-AssetLibConfig {
     )
 
     try {
-        $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $configPath -Encoding UTF8
         # Docs:
         #   ConvertTo-Json: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/convertto-json
         #   Set-Content   : https://learn.microsoft.com/powershell/module/microsoft.powershell.management/set-content
+        $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $configPath -Encoding UTF8
         Write-Host "Updated assetlib.config.json"
     }
     catch {
@@ -87,9 +105,12 @@ function Set-AssetLibConfig {
     }
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Config handling
+#==============================================================================
 
-# region: Manifest helpers -----------------------------------------------------
+#==============================================================================
+# region: Manifest helpers
+#==============================================================================
 
 # Load all packs from packs.json (if present).
 function Get-AssetPackManifest {
@@ -175,12 +196,16 @@ function Get-AssetPackLicenseStatus {
     }
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Manifest helpers
+#==============================================================================
 
-# region: Misc helpers ---------------------------------------------------------
+#==============================================================================
+# region: Misc helpers
+#==============================================================================
 
 # Convert common Google Drive URLs into a direct-download link suitable for
-# Invoke-WebRequest. This lets you paste the normal "Get link" URL from Drive.
+# HttpClient / Invoke-WebRequest. This lets you paste the normal "Get link"
+# URL from Drive.
 #
 # Supported patterns:
 #   - https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
@@ -188,9 +213,8 @@ function Get-AssetPackLicenseStatus {
 #   - Anything already starting with https://drive.google.com/uc?...
 #
 # For unsupported or non-Drive URLs, the original value is returned.
-# This keeps the function safe for other hosts (e.g. S3, itch.io, etc.).
 #
-# Docs for [regex] in PowerShell:
+# Docs (regex in PowerShell):
 #   https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_regular_expressions
 function Convert-ToGoogleDriveDirectDownloadUrl {
     param(
@@ -209,7 +233,6 @@ function Convert-ToGoogleDriveDirectDownloadUrl {
     # Warn if it looks like a FOLDER url - those won't work as archive_url.
     if ($Url -match '^https://drive\.google\.com/drive/folders/') {
         Write-Warning "The provided URL looks like a Google Drive FOLDER link. archive_url should point to a ZIP FILE, not a folder."
-        # We still return the original so the caller can decide what to do.
         return $Url
     }
 
@@ -222,7 +245,7 @@ function Convert-ToGoogleDriveDirectDownloadUrl {
         }
     }
 
-    # Pattern 2: ...id=<FILE_ID> in the query string (open?id=... or similar)
+    # Pattern 2: anything with id=<FILE_ID> in query string
     $idIndex = $Url.IndexOf('id=')
     if ($idIndex -ge 0) {
         $idPart = $Url.Substring($idIndex + 3)
@@ -239,20 +262,49 @@ function Convert-ToGoogleDriveDirectDownloadUrl {
     return $Url
 }
 
+# Write a simple log line into .assetlib/logs under the current project root.
+# This is best-effort only; logging failures are swallowed so they don't break core behavior.
+# Docs (Add-Content): https://learn.microsoft.com/powershell/module/microsoft.powershell.management/add-content
+function Write-AssetLibProjectLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
 
-# endregion --------------------------------------------------------------------
+    try {
+        $logDir = Join-Path $ProjectRoot ".assetlib\logs"
+        if (-not (Test-Path $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
 
-# region: Unreal project helpers ----------------------------------------------
+        $logFile = Join-Path $logDir ("assetlib_" + (Get-Date -Format "yyyyMMdd") + ".log")
+        $line = "[{0}] {1}" -f (Get-Date -Format "u"), $Message
+        Add-Content -Path $logFile -Value $line
+    }
+    catch {
+        # Intentionally ignore logging errors.
+    }
+}
+
+# endregion Misc helpers
+#==============================================================================
+
+#==============================================================================
+# region: Unreal project helpers
+#==============================================================================
 
 # Detect if Unreal Editor is running.
-# Checks for common process names: UnrealEditor, UnrealEditor-Cmd, UE4Editor, UE5Editor
+# Checks for common process names: UnrealEditor, UnrealEditor-Cmd, UE4Editor, UE5Editor.
+# Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.management/get-process
 function Test-UnrealEditorRunning {
     try {
         $procs = Get-Process -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -match '^UnrealEditor' -or
-            $_.Name -match '^UE[45]Editor'
-        }
+            Where-Object {
+                $_.Name -match '^UnrealEditor' -or
+                $_.Name -match '^UE[45]Editor'
+            }
 
         return ($procs.Count -gt 0)
     }
@@ -266,6 +318,7 @@ function Test-UnrealEditorRunning {
 # We define it as a directory that:
 #  - Contains at least one *.uproject file
 #  - Contains a Content/ folder
+# Docs (Get-ChildItem): https://learn.microsoft.com/powershell/module/microsoft.powershell.management/get-childitem
 function Get-UnrealProjectRoot {
     param(
         [string]$Path = (Get-Location).Path
@@ -322,11 +375,14 @@ function Get-AssetPackInstallPath {
     }
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Unreal project helpers
+#==============================================================================
 
-# region: Listing & basic operations ------------------------------------------
+#==============================================================================
+# region: Listing & basic operations
+#==============================================================================
 
-# List all packs, optionally filtered by Category/Tag
+# List all packs, optionally filtered by Category/Tag.
 function Get-AssetPackList {
     param(
         [string]$Category,
@@ -339,8 +395,7 @@ function Get-AssetPackList {
         return
     }
 
-    # Filter by category if specified.
-    # categories is expected to be an array in packs.json.
+    # Filter by category if specified (categories is an array).
     if ($Category) {
         $packs = $packs | Where-Object { $_.categories -contains $Category }
     }
@@ -362,7 +417,7 @@ function Get-AssetPackList {
     }
 }
 
-# Show the full JSON for a single pack
+# Show the full JSON for a single pack.
 function Get-AssetPack {
     param(
         [Parameter(Mandatory = $true)]
@@ -452,20 +507,23 @@ function Get-AssetLicense {
     }
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Listing & basic operations
+#==============================================================================
 
-# region: Add / Remove pack ----------------------------------------------------
+#==============================================================================
+# region: Add / Remove pack
+#==============================================================================
 
 # Interactive add flow for a new pack:
-# - offers to open the asset store root (from config) in browser
+# - opens asset store root (from config) in browser (optional)
 # - collects fields for the pack
 # - automatically converts Google Drive file URLs into direct-download URLs
 #   for archive_url (uc?export=download&id=...)
 # - adds optional engineVersion metadata (e.g. "5.3")
 # - enforces license rules based on licenseMode
 function Add-AssetPack {
-    $packs = Get-AssetPackManifest
-    $config = Get-AssetLibConfig
+    $packs    = Get-AssetPackManifest
+    $config   = Get-AssetLibConfig
     $licenses = Get-AssetLicenseManifest
 
     if (-not $licenses -or $licenses.Count -eq 0) {
@@ -487,8 +545,7 @@ function Add-AssetPack {
     $source = Read-Host "source (Fab/Quixel/Self/etc) [Fab]"
     if (-not $source) { $source = "Fab" }
 
-    # QoL: open your asset root (e.g., Google Drive 'GameLibrary/Packs') first,
-    # so you can create/find the folder and copy its URL.
+    # QoL: open your asset root (e.g., Google Drive 'GameLibrary/Packs') first.
     $openDrive = Read-Host "Open asset store root in your browser now to create/find the folder URL? (Y/N) [N]"
     if ($openDrive -match '^[Yy]') {
         $driveUrl = $config.assetRootUrl
@@ -503,13 +560,10 @@ function Add-AssetPack {
     $cloudUrl = Read-Host "Google Drive folder URL (cloud_url)"
 
     # archive_url handling:
-    # We allow the user to paste either:
-    #   - a full Drive FILE URL (e.g. 'file/d/<id>/view?usp=sharing'), or
-    #   - a prebuilt direct download URL, or
-    #   - any other host URL (S3, itch.io, etc.).
-    #
-    # If it looks like a Google Drive file URL, we convert it to the direct
-    # download form for you so you don't have to manually extract FILE_ID.
+    # User can paste:
+    #   - a Drive FILE URL (file/d/<id>/view?usp=sharing), or
+    #   - a ready direct download URL, or
+    #   - arbitrary host URL.
     $archiveUrlRaw = Read-Host "Direct download archive URL or Drive FILE URL (archive_url, optional)"
     $archiveUrl = $null
     if ($archiveUrlRaw) {
@@ -528,22 +582,22 @@ function Add-AssetPack {
     $categories = @()
     if ($catsRaw) {
         $categories = $catsRaw.Split(",") |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ }
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }
     }
 
     $tagsRaw = Read-Host "tags (comma-separated)"
     $tags = @()
     if ($tagsRaw) {
         $tags = $tagsRaw.Split(",") |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ }
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }
     }
 
     $notes = Read-Host "notes (optional)"
 
     # Optional engine version metadata:
-    # Example: "5.3", "5.4", etc. Used for soft compatibility warnings on install.
+    # Example: "5.3", "5.4", etc.
     $engineVersion = Read-Host "engine version this pack/plugin was built/tested against (optional, e.g. 5.3)"
 
     Write-Host ""
@@ -627,7 +681,6 @@ function Add-AssetPack {
     Write-Host "Added pack $id with license '$licenseId' in mode '$licenseMode'." -ForegroundColor Green
 }
 
-
 # Remove a pack by id from the manifest only; does NOT delete Google Drive or project files.
 function Remove-AssetPack {
     param(
@@ -657,9 +710,12 @@ function Remove-AssetPack {
     Write-Host "Removed pack $Id from manifest (no project or Drive files were deleted)." -ForegroundColor Yellow
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Add / Remove pack
+#==============================================================================
 
-# region: Install / Uninstall into Unreal project -----------------------------
+#==============================================================================
+# region: Install / Uninstall into Unreal project
+#==============================================================================
 
 # Install a pack into the current Unreal project root.
 # Downloads archive_url and extracts into the appropriate folder based on packType.
@@ -669,15 +725,18 @@ function Remove-AssetPack {
 #   - Editor safety: blocks while Unreal Editor is running unless -Force
 #   - Engine-version awareness for plugins (+ -Force override)
 #   - C++ plugin vs Blueprint-only project warning
-#   - Engine-style plugin archive detection: BLOCKED COMPLETELY
+#   - Engine-style plugin archive detection: BLOCKED COMPLETELY (never installed)
+#   - Local archive cache under %LOCALAPPDATA%\assetlib\cache
 #   - ZIP validation (header check)
-#   - Streaming download with progress bar (HttpClient + Write-Progress)
+#   - Streaming download with progress bar
 #   - Flattening of single top-level folder in zip to avoid double nesting
+#   - -Preview mode: does everything except modify project files
 function Install-AssetPack {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Id,
-        [switch]$Force
+        [switch]$Force,
+        [switch]$Preview
     )
 
     $projectRoot = Get-UnrealProjectRoot
@@ -704,8 +763,8 @@ function Install-AssetPack {
         return
     }
 
-    $licenses = Get-AssetLicenseManifest
-    $config = Get-AssetLibConfig
+    $licenses    = Get-AssetLicenseManifest
+    $config      = Get-AssetLibConfig
     $licenseMode = $config.licenseMode
 
     $status = Get-AssetPackLicenseStatus -Pack $pack -Licenses $licenses
@@ -737,7 +796,6 @@ function Install-AssetPack {
     try {
         $uprojectFiles = Get-ChildItem -Path $projectRoot -Filter *.uproject
         if ($uprojectFiles.Count -ge 1) {
-            # If multiple, just take the first; typical project has one.
             $uprojectPath = $uprojectFiles[0].FullName
             $uprojectJson = Get-Content $uprojectPath -Raw | ConvertFrom-Json
 
@@ -771,84 +829,116 @@ function Install-AssetPack {
     }
 
     if (Test-Path $targetPath) {
-        if (-not $Force) {
-            $confirm = Read-Host "Target '$targetPath' already exists. Overwrite? (Y/N) [N]"
-            if ($confirm -notmatch '^[Yy]') {
-                Write-Host "Install cancelled."
+        if ($Preview) {
+            Write-Host "Preview: target path '$targetPath' already exists and WOULD be overwritten." -ForegroundColor Yellow
+        }
+        else {
+            if (-not $Force) {
+                $confirm = Read-Host "Target '$targetPath' already exists. Overwrite? (Y/N) [N]"
+                if ($confirm -notmatch '^[Yy]') {
+                    Write-Host "Install cancelled."
+                    return
+                }
+            }
+
+            try {
+                Remove-Item -LiteralPath $targetPath -Recurse -Force
+            }
+            catch {
+                Write-Error "Failed to remove existing target path '$targetPath': $($_.Exception.Message)"
                 return
             }
         }
+    }
 
+    $tempFile    = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_" + $Id + "_" + [System.Guid]::NewGuid().ToString() + ".zip")
+    $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_extract_" + $Id + "_" + [System.Guid]::NewGuid().ToString())
+
+    # Local cache under %LOCALAPPDATA%\assetlib\cache
+    $cacheRoot = Join-Path $env:LOCALAPPDATA "assetlib\cache"
+    if (-not (Test-Path $cacheRoot)) {
+        New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
+    }
+    $cacheFile = Join-Path $cacheRoot ($Id + ".zip")
+
+    $usedCache = $false
+
+    # Try to reuse cache if available.
+    if (Test-Path $cacheFile -and -not $Force) {
+        $useCache = Read-Host "A cached archive for '$Id' exists. Use cached file instead of re-downloading? (Y/N) [Y]"
+        if (-not $useCache -or $useCache -match '^[Yy]') {
+            Copy-Item -LiteralPath $cacheFile -Destination $tempFile -Force
+            $usedCache = $true
+            Write-Host "Using cached archive: $cacheFile" -ForegroundColor Cyan
+        }
+    }
+
+    # --- Streaming download with progress bar using HttpClient ----------------
+    if (-not $usedCache) {
         try {
-            Remove-Item -LiteralPath $targetPath -Recurse -Force
+            Write-Host "Downloading archive for '$Id' from $($pack.archive_url)..."
+
+            # Docs: System.Net.Http.HttpClient
+            # https://learn.microsoft.com/dotnet/api/system.net.http.httpclient
+            $handler = [System.Net.Http.HttpClientHandler]::new()
+            $handler.AllowAutoRedirect = $true
+            $client = [System.Net.Http.HttpClient]::new($handler)
+            $response = $client.GetAsync($pack.archive_url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+
+            if (-not $response.IsSuccessStatusCode) {
+                throw "HTTP $([int]$response.StatusCode) - $($response.ReasonPhrase)"
+            }
+
+            $contentLength = $response.Content.Headers.ContentLength
+            $inStream  = $response.Content.ReadAsStream()
+            $outStream = [System.IO.File]::Open($cacheFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+
+            try {
+                $buffer    = New-Object byte[] 8192
+                $totalRead = 0L
+                $read      = 0
+
+                do {
+                    $read = $inStream.Read($buffer, 0, $buffer.Length)
+                    if ($read -gt 0) {
+                        $outStream.Write($buffer, 0, $read)
+                        $totalRead += $read
+
+                        if ($contentLength -and $contentLength -gt 0) {
+                            $percent = [int](($totalRead * 100) / $contentLength)
+                            # Docs: Write-Progress
+                            # https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/write-progress
+                            Write-Progress -Activity "Downloading $Id" -Status "$percent% complete" -PercentComplete $percent
+                        }
+                    }
+                } while ($read -gt 0)
+
+                Write-Progress -Activity "Downloading $Id" -Completed
+            }
+            finally {
+                if ($outStream) { $outStream.Dispose() }
+                if ($inStream)  { $inStream.Dispose() }
+                if ($client)    { $client.Dispose() }
+            }
+
+            # Copy cache into temp file for subsequent validation/extraction.
+            Copy-Item -LiteralPath $cacheFile -Destination $tempFile -Force
         }
         catch {
-            Write-Error "Failed to remove existing target path '$targetPath': $($_.Exception.Message)"
+            Write-Error "Failed to download archive from '$($pack.archive_url)': $($_.Exception.Message)"
+            if (Test-Path $tempFile) {
+                Remove-Item $tempFile -Force
+            }
+            # Best-effort cleanup of bad cache.
+            if (Test-Path $cacheFile -and -not $usedCache) {
+                Remove-Item $cacheFile -Force
+            }
             return
         }
     }
 
-    $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_" + $Id + "_" + [System.Guid]::NewGuid().ToString() + ".zip")
-    $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_extract_" + $Id + "_" + [System.Guid]::NewGuid().ToString())
-
-    # --- Streaming download with progress bar using HttpClient ----------------
-    try {
-        Write-Host "Downloading archive for '$Id' from $($pack.archive_url)..."
-
-        # Docs: System.Net.Http.HttpClient
-        # https://learn.microsoft.com/dotnet/api/system.net.http.httpclient
-        $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $true
-        $client = [System.Net.Http.HttpClient]::new($handler)
-        $response = $client.GetAsync($pack.archive_url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
-
-        if (-not $response.IsSuccessStatusCode) {
-            throw "HTTP $([int]$response.StatusCode) - $($response.ReasonPhrase)"
-        }
-
-        $contentLength = $response.Content.Headers.ContentLength
-        $inStream = $response.Content.ReadAsStream()
-        $outStream = [System.IO.File]::Open($tempFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-
-        try {
-            $buffer = New-Object byte[] 8192
-            $totalRead = 0L
-            $read = 0
-
-            do {
-                $read = $inStream.Read($buffer, 0, $buffer.Length)
-                if ($read -gt 0) {
-                    $outStream.Write($buffer, 0, $read)
-                    $totalRead += $read
-
-                    if ($contentLength -and $contentLength -gt 0) {
-                        $percent = [int](($totalRead * 100) / $contentLength)
-                        # Docs: Write-Progress
-                        # https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/write-progress
-                        Write-Progress -Activity "Downloading $Id" -Status "$percent% complete" -PercentComplete $percent
-                    }
-                }
-            } while ($read -gt 0)
-
-            Write-Progress -Activity "Downloading $Id" -Completed
-        }
-        finally {
-            if ($outStream) { $outStream.Dispose() }
-            if ($inStream) { $inStream.Dispose() }
-            if ($client) { $client.Dispose() }
-        }
-    }
-    catch {
-        Write-Error "Failed to download archive from '$($pack.archive_url)': $($_.Exception.Message)"
-        if (Test-Path $tempFile) {
-            Remove-Item $tempFile -Force
-        }
-        return
-    }
-
     # Before extracting, sanity-check that the file looks like a ZIP.
     # ZIP files typically start with the bytes 'PK' (0x50 0x4B).
-    # Use System.IO.File APIs so this works on both Windows PowerShell and PowerShell 7+.
     try {
         $headerBytes = New-Object byte[] 4
         $fs = [System.IO.File]::OpenRead($tempFile)
@@ -867,7 +957,6 @@ function Install-AssetPack {
     if ($read -lt 2 -or
         $headerBytes[0] -ne 0x50 -or $headerBytes[1] -ne 0x4B) {
 
-        # Keep a copy of what we downloaded so you can inspect it.
         $debugCopy = Join-Path $projectRoot ("assetlib_failed_download_" + $Id + ".bin")
         Copy-Item -LiteralPath $tempFile -Destination $debugCopy -Force
 
@@ -889,12 +978,10 @@ Verify that:
 
     try {
         Write-Host "Extracting archive to temporary folder '$tempExtract'..."
-        # Docs: Expand-Archive
-        # https://learn.microsoft.com/powershell/module/microsoft.powershell.archive/expand-archive
+        # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.archive/expand-archive
         Expand-Archive -Path $tempFile -DestinationPath $tempExtract -Force
     }
     catch {
-        # Keep a copy of the downloaded file for debugging on extraction errors.
         $debugCopy = Join-Path $projectRoot ("assetlib_failed_extract_" + $Id + ".zip")
         Copy-Item -LiteralPath $tempFile -Destination $debugCopy -Force
 
@@ -940,7 +1027,6 @@ If it is not, double-check the archive_url in packs.json and the Drive sharing s
             }
 
             if ($upluginJson) {
-                # Show some basic metadata for visibility.
                 Write-Host "Plugin descriptor:" -ForegroundColor Cyan
                 Write-Host "  Name:        $($upluginJson.FriendlyName)"
                 Write-Host "  VersionName: $($upluginJson.VersionName)"
@@ -973,6 +1059,7 @@ require manual installation into Engine/Plugins with elevated permissions.
                 $choice = Read-Host "Choose action: [K]eep in manifest only, [R]emove from manifest [K]"
                 if (-not $choice -or $choice -match '^[Kk]') {
                     Write-Error "Install aborted. Pack '$Id' remains in packs.json for tracking only. Install it into Engine/Plugins manually if needed."
+                    Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Install of '$Id' blocked: engine-level plugin package (kept in manifest)."
                     return
                 }
                 elseif ($choice -match '^[Rr]') {
@@ -988,10 +1075,12 @@ require manual installation into Engine/Plugins with elevated permissions.
                     }
 
                     Write-Error "Install aborted. Engine-level plugin package '$Id' was removed from the manifest."
+                    Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Install of '$Id' blocked: engine-level plugin package (removed from manifest)."
                     return
                 }
                 else {
                     Write-Error "Install aborted. Pack '$Id' remains in packs.json for tracking only."
+                    Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Install of '$Id' blocked: engine-level plugin package (kept in manifest, choice other)."
                     return
                 }
             }
@@ -1002,6 +1091,7 @@ require manual installation into Engine/Plugins with elevated permissions.
                     $msg = "Plugin '$Id' targets engine major version $pluginEngineMajor (from .uplugin) but the project appears to use $projectEngineMajor.x."
                     if (-not $Force) {
                         Write-Error "$msg Install blocked. Use -Force to override if you know this plugin is compatible."
+                        Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Install of '$Id' blocked: $msg"
                         return
                     }
                     else {
@@ -1012,6 +1102,7 @@ require manual installation into Engine/Plugins with elevated permissions.
                     $msg = "Plugin '$Id' targets engine $pluginEngineMajor.$pluginEngineMinor, which is NEWER than the project engine $projectEngineMajor.$projectEngineMinor."
                     if (-not $Force) {
                         Write-Error "$msg Install blocked. Use -Force if you understand the risk."
+                        Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Install of '$Id' blocked: $msg"
                         return
                     }
                     else {
@@ -1022,6 +1113,7 @@ require manual installation into Engine/Plugins with elevated permissions.
                     $msg = "Plugin '$Id' targets engine $pluginEngineMajor.$pluginEngineMinor, which is OLDER than the project engine $projectEngineMajor.$projectEngineMinor."
                     if (-not $Force) {
                         Write-Error "$msg Install blocked by default. Re-run with -Force if you want to try it anyway (many plugins do work on newer minor versions)."
+                        Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Install of '$Id' blocked: $msg"
                         return
                     }
                     else {
@@ -1052,18 +1144,33 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
             }
         }
 
-        # Now we inspect the extracted structure to avoid double-nesting like:
+        # Inspect extracted structure to avoid double-nesting like:
         #   Content\AssetLib\<id>\<id>\<content>
-        #
-        # Strategy:
-        #   - If the temp extract root contains exactly ONE top-level directory
-        #     and NO files, treat that directory as a wrapper folder and move
-        #     its CONTENTS into targetPath (flattening).
-        #   - Otherwise, move everything from the temp extract root into targetPath.
-
         $topEntries = Get-ChildItem -Path $tempExtract
-        $topDirs = $topEntries | Where-Object { $_.PSIsContainer }
-        $topFiles = $topEntries | Where-Object { -not $_.PSIsContainer }
+        $topDirs    = $topEntries | Where-Object { $_.PSIsContainer }
+        $topFiles   = $topEntries | Where-Object { -not $_.PSIsContainer }
+
+        if ($Preview) {
+            Write-Host ""
+            Write-Host "PREVIEW for '$Id':" -ForegroundColor Cyan
+            Write-Host "  Target path: $targetPath"
+            if ($topDirs.Count -eq 1 -and $topFiles.Count -eq 0) {
+                Write-Host "  Archive contains a single top-level folder '$($topDirs[0].Name)' and would be FLATTENED into the target path to avoid double nesting."
+            }
+            else {
+                Write-Host "  Archive contains multiple top-level entries and would be copied as-is into the target path."
+            }
+
+            Write-Host ""
+            Write-Host "  Top-level entries in archive extract root:"
+            foreach ($e in $topEntries) {
+                $kind = if ($e.PSIsContainer) { "DIR " } else { "FILE" }
+                Write-Host ("    {0}  {1}" -f $kind, $e.Name)
+            }
+
+            Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Preview install for '$Id' completed (no changes to project)."
+            return
+        }
 
         # Ensure targetPath exists before moving content.
         if (-not (Test-Path $targetPath)) {
@@ -1071,7 +1178,6 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
         }
 
         if ($topDirs.Count -eq 1 -and $topFiles.Count -eq 0) {
-            # Single wrapper directory case: flatten it.
             $wrapperDir = $topDirs[0]
             Write-Host "Detected single top-level folder '$($wrapperDir.Name)' in archive. Flattening into '$targetPath' to avoid double nesting..."
 
@@ -1081,7 +1187,6 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
             }
         }
         else {
-            # Mixed files/folders or multiple top-level entries: move them all as-is.
             Write-Host "Archive has multiple top-level entries or files; copying structure into '$targetPath'..."
             Get-ChildItem -Path $tempExtract | ForEach-Object {
                 $dest = Join-Path $targetPath $_.Name
@@ -1090,12 +1195,13 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
         }
 
         Write-Host "Installed pack '$Id' to '$targetPath' (licenseMode=$licenseMode)." -ForegroundColor Green
+        Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Installed pack '$Id' to '$targetPath' (licenseMode=$licenseMode, preview=$Preview, usedCache=$usedCache)."
     }
     catch {
         Write-Error "Failed while moving or processing extracted content for '$Id' into '$targetPath': $($_.Exception.Message)"
+        Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Install of '$Id' failed: $($_.Exception.Message)"
     }
     finally {
-        # Clean up temp locations if they exist.
         if (Test-Path $tempFile) {
             Remove-Item $tempFile -Force
         }
@@ -1127,7 +1233,7 @@ function Uninstall-AssetPackFromProject {
         return
     }
 
-    # Prevent uninstalling while Unreal Editor is running unless -Force is used
+    # Prevent uninstalling while Unreal Editor is running unless -Force is used.
     if (Test-UnrealEditorRunning) {
         if (-not $Force) {
             Write-Error "Unreal Editor appears to be running. Close the editor before uninstalling a pack, or run again with -Force to override."
@@ -1137,7 +1243,6 @@ function Uninstall-AssetPackFromProject {
             Write-Warning "Unreal Editor appears to be running. Forcing uninstall anyway."
         }
     }
-
 
     $targetPath = Get-AssetPackInstallPath -Pack $pack -ProjectRoot $projectRoot
 
@@ -1170,9 +1275,12 @@ function Uninstall-AssetPackFromProject {
     }
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Install / Uninstall
+#==============================================================================
 
-# region: Audit & prune -------------------------------------------------------
+#==============================================================================
+# region: Audit & prune
+#==============================================================================
 
 # Audit all packs against license rules:
 # - NO-LICENSE: licenseId missing
@@ -1180,35 +1288,26 @@ function Uninstall-AssetPackFromProject {
 # - NON-COMMERCIAL: commercialAllowed == false
 # - OK: commercialAllowed == true
 #
-# If -Prune is provided, and licenseMode is 'restrictive', removes installed packs
-# from the current Unreal project based on license selection rules.
+# Pure audit only. Pruning is handled by Invoke-AssetPackPrune.
 function Test-AssetPackLicenses {
-    param(
-        [switch]$Prune,
-        [string[]]$Licenses,
-        [switch]$Force
-    )
-
-    $packs = Get-AssetPackManifest
+    $packs    = Get-AssetPackManifest
     $licenses = Get-AssetLicenseManifest
-    $config = Get-AssetLibConfig
 
     if (-not $packs -or $packs.Count -eq 0) {
         Write-Host "No packs in manifest to audit." -ForegroundColor Yellow
-        return
+        return @()
     }
 
-    $issues = 0
+    $issues  = 0
     $results = New-Object System.Collections.Generic.List[object]
 
     Write-Host "Asset pack license audit:" -ForegroundColor Cyan
     Write-Host "------------------------------------------------------------"
 
     foreach ($p in $packs) {
-        $status = Get-AssetPackLicenseStatus -Pack $p -Licenses $licenses
-
-        $id = $p.id
-        $name = $p.name
+        $status    = Get-AssetPackLicenseStatus -Pack $p -Licenses $licenses
+        $id        = $p.id
+        $name      = $p.name
         $licenseId = $p.licenseId
 
         switch ($status.Status) {
@@ -1230,11 +1329,11 @@ function Test-AssetPackLicenses {
         }
 
         $results.Add([pscustomobject]@{
-                Pack      = $p
-                Status    = $status.Status
-                License   = $status.License
-                LicenseId = $status.LicenseId
-            })
+            Pack      = $p
+            Status    = $status.Status
+            License   = $status.License
+            LicenseId = $status.LicenseId
+        })
     }
 
     Write-Host "------------------------------------------------------------"
@@ -1245,118 +1344,186 @@ function Test-AssetPackLicenses {
         Write-Host "All packs pass license audit (commercialAllowed = true)." -ForegroundColor Green
     }
 
-    if (-not $Prune) {
-        return
-    }
+    return ,$results
+}
 
-    # From here on we are in prune mode: delete installed packs in the current project.
-    if ($config.licenseMode -ne 'restrictive') {
-        Write-Error "audit -Prune is only allowed in 'restrictive' license mode (current mode: '$($config.licenseMode)'). Use 'assetlib mode restrictive' to switch."
-        return
-    }
+# Validate a single pack (quick or deep).
+function Invoke-AssetPackValidate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+        [switch]$Deep
+    )
 
     $projectRoot = Get-UnrealProjectRoot
-    if (-not $projectRoot) {
-        Write-Error "audit -Prune must be run from the root of an Unreal project (folder with a .uproject file and a Content/ folder)."
+
+    $packs = Get-AssetPackManifest
+    $pack  = $packs | Where-Object { $_.id -eq $Id }
+    if (-not $pack) {
+        Write-Error "No pack found with id: $Id"
         return
     }
 
-    # Prevent pruning while Unreal Editor is running unless -Force is used
-    if (Test-UnrealEditorRunning) {
-        if (-not $Force) {
-            Write-Error "Unreal Editor appears to be running. Close the editor before pruning installed packs, or run again with -Force to override."
-            return
-        }
-        else {
-            Write-Warning "Unreal Editor appears to be running. Forcing prune anyway."
-        }
+    $licenses = Get-AssetLicenseManifest
+    $status   = Get-AssetPackLicenseStatus -Pack $pack -Licenses $licenses
+
+    Write-Host "Pack: $($pack.id)" -ForegroundColor Cyan
+    Write-Host "  Name:          $($pack.name)"
+    Write-Host "  Source:        $($pack.source)"
+    Write-Host "  packType:      $($pack.packType)"
+    Write-Host "  licenseId:     $($pack.licenseId)"
+    Write-Host "  licenseStatus: $($status.Status)"
+    Write-Host "  engineVersion: $($pack.engineVersion)"
+    Write-Host "  archive_url:   $($pack.archive_url)"
+
+    if (-not $pack.archive_url) {
+        Write-Warning "Pack '$Id' has no archive_url set; install/validate cannot check archive content."
     }
 
-
-    $targetsToRemove = New-Object System.Collections.Generic.List[object]
-
-    foreach ($entry in $results) {
-        $pack = $entry.Pack
-        $status = $entry.Status
-        $lid = $entry.LicenseId
-
-        # Determine if this pack is installed in the current project.
-        $installPath = Get-AssetPackInstallPath -Pack $pack -ProjectRoot $projectRoot
-        if (-not (Test-Path $installPath)) {
-            continue
-        }
-
-        $shouldRemove = $false
-
-        if ($Licenses -and $Licenses.Count -gt 0) {
-            # Explicit license selection.
-            if (-not $lid) {
-                if ($Licenses -contains 'NO-LICENSE') { $shouldRemove = $true }
-            }
-            elseif (-not ($licenses | Where-Object { $_.id -eq $lid })) {
-                if ($Licenses -contains 'UNKNOWN-LICENSE') { $shouldRemove = $true }
-            }
-            else {
-                if ($Licenses -contains $lid) { $shouldRemove = $true }
-            }
-        }
-        else {
-            # Default behavior: remove all installed packs that are not commercial-safe.
-            if ($status -ne 'OK') {
-                $shouldRemove = $true
-            }
-        }
-
-        if ($shouldRemove) {
-            $targetsToRemove.Add([pscustomobject]@{
-                    Pack   = $pack
-                    Path   = $installPath
-                    Status = $status
-                })
-        }
-    }
-
-    if ($targetsToRemove.Count -eq 0) {
-        Write-Host "No installed packs in this project match prune criteria."
+    if (-not $Deep) {
+        Write-Host ""
+        Write-Host "Use 'assetlib validate $Id -Deep' for a full deep-dive (download + plugin checks + structure preview)." -ForegroundColor Yellow
         return
     }
 
     Write-Host ""
-    Write-Host "The following installed packs will be removed from this Unreal project:" -ForegroundColor Yellow
-    foreach ($t in $targetsToRemove) {
-        Write-Host ("- {0} ({1}) at {2}" -f $t.Pack.id, $t.Status, $t.Path)
+    Write-Host "Running deep validation (download + preview install) for '$Id'..." -ForegroundColor Cyan
+
+    try {
+        # Reuse Install-AssetPack in Preview mode so we exercise the exact same path.
+        Install-AssetPack -Id $Id -Preview
     }
-
-    if (-not $Force) {
-        $confirm = Read-Host "Proceed with pruning these packs from this project? (Y/N) [N]"
-        if ($confirm -notmatch '^[Yy]') {
-            Write-Host "Prune cancelled."
-            return
-        }
-    }
-
-    foreach ($t in $targetsToRemove) {
-        $path = $t.Path
-
-        # Safety: ensure we only delete inside the project root.
-        if (-not $path.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-            Write-Error "Skipping removal of '$($t.Pack.id)': resolved path '$path' is not under project root '$projectRoot'."
-            continue
-        }
-
-        try {
-            Remove-Item -LiteralPath $path -Recurse -Force
-            Write-Host "Removed '$($t.Pack.id)' from '$path'." -ForegroundColor Green
-        }
-        catch {
-            Write-Error "Failed to remove '$($t.Pack.id)' from '$path': $($_.Exception.Message)"
-        }
+    catch {
+        Write-Error "Deep validation for '$Id' failed: $($_.Exception.Message)"
     }
 }
 
-# endregion --------------------------------------------------------------------
+# Validate all packs in packs.json (quick or deep).
+function Invoke-AssetPackValidateAll {
+    param(
+        [switch]$Deep
+    )
 
-# region: License mode --------------------------------------------------------
+    $packs    = Get-AssetPackManifest
+    $licenses = Get-AssetLicenseManifest
+
+    if (-not $packs -or $packs.Count -eq 0) {
+        Write-Host "No packs in manifest to validate." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Validating all packs in manifest..." -ForegroundColor Cyan
+
+    foreach ($p in $packs) {
+        $status      = Get-AssetPackLicenseStatus -Pack $p -Licenses $licenses
+        $hasArchive  = [bool]$p.archive_url
+        $archiveFlag = if ($hasArchive) { "archive_url=YES" } else { "archive_url=NO" }
+
+        "{0,-30} {1,-18} {2,-15} {3}" -f $p.id, "[$($status.Status)]", "packType=$($p.packType)", $archiveFlag
+
+        if ($Deep) {
+            Write-Host ""
+            Invoke-AssetPackValidate -Id $p.id -Deep
+            Write-Host ""
+            Write-Host "----------------------------------------"
+        }
+    }
+
+    if (-not $Deep) {
+        Write-Host ""
+        Write-Host "Use 'assetlib validate --all -Deep' for full per-pack previews (downloads required)." -ForegroundColor Yellow
+    }
+}
+
+# Prune installed pack directories from the current Unreal project based on license status.
+# Default: removes NON-COMMERCIAL, UNKNOWN-LICENSE, and NO-LICENSE pack installs.
+#   -DryRun : just prints what WOULD be removed.
+function Invoke-AssetPackPrune {
+    param(
+        [string[]]$StatusesToRemove = @("NON-COMMERCIAL", "UNKNOWN-LICENSE", "NO-LICENSE"),
+        [switch]$DryRun
+    )
+
+    $projectRoot = Get-UnrealProjectRoot
+    if (-not $projectRoot) {
+        Write-Error "Prune must be run from an Unreal project root (folder with a .uproject file and a Content/ folder)."
+        return
+    }
+
+    # Editor safety when pruning installed content/plugins.
+    if (Test-UnrealEditorRunning -and -not $DryRun) {
+        Write-Error "Unreal Editor appears to be running. Close the editor before pruning installed packs (recommended to avoid file locks)."
+        return
+    }
+
+    $packs    = Get-AssetPackManifest
+    $licenses = Get-AssetLicenseManifest
+
+    if (-not $packs -or $packs.Count -eq 0) {
+        Write-Host "No packs in manifest to prune." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Pruning installed packs with license statuses: $($StatusesToRemove -join ', ')" -ForegroundColor Cyan
+
+    $toRemove = @()
+
+    foreach ($p in $packs) {
+        $st = Get-AssetPackLicenseStatus -Pack $p -Licenses $licenses
+        if ($StatusesToRemove -contains $st.Status) {
+            $installPath = Get-AssetPackInstallPath -Pack $p -ProjectRoot $projectRoot
+            if (Test-Path $installPath) {
+                $toRemove += [PSCustomObject]@{
+                    Id     = $p.id
+                    Path   = $installPath
+                    Status = $st.Status
+                }
+            }
+        }
+    }
+
+    if ($toRemove.Count -eq 0) {
+        Write-Host "No installed pack directories matched the specified statuses." -ForegroundColor Green
+        return
+    }
+
+    foreach ($item in $toRemove) {
+        if ($DryRun) {
+            Write-Host "[DRY-RUN] Would remove '$($item.Path)' for pack '$($item.Id)' (status=$($item.Status))."
+        }
+        else {
+            Write-Host "Removing '$($item.Path)' for pack '$($item.Id)' (status=$($item.Status))..."
+            try {
+                # Safety: ensure path is inside project root.
+                if (-not $item.Path.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    Write-Error "Skipping removal of '$($item.Id)': resolved path '$($item.Path)' is not under project root '$projectRoot'."
+                    continue
+                }
+
+                Remove-Item -LiteralPath $item.Path -Recurse -Force
+                Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "Pruned installed path '$($item.Path)' for pack '$($item.Id)' (status=$($item.Status))."
+            }
+            catch {
+                Write-Error "Failed to remove '$($item.Path)' for pack '$($item.Id)': $($_.Exception.Message)"
+                Write-AssetLibProjectLog -ProjectRoot $projectRoot -Message "FAILED prune of '$($item.Path)' for pack '$($item.Id)': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if ($DryRun) {
+        Write-Host "Dry-run complete. No files were actually deleted." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Prune complete." -ForegroundColor Green
+    }
+}
+
+# endregion Audit & prune
+#==============================================================================
+
+#==============================================================================
+# region: License mode
+#==============================================================================
 
 # Show or set license mode (restrictive/permissive).
 function GetSet-AssetLibMode {
@@ -1384,169 +1551,429 @@ function GetSet-AssetLibMode {
     Write-Host "Set license mode to '$normalized'." -ForegroundColor Green
 }
 
-# endregion --------------------------------------------------------------------
+# endregion License mode
+#==============================================================================
 
-# region: Help -----------------------------------------------------------------
+#==============================================================================
+# region: Status & cache helpers
+#==============================================================================
+
+# Show assetlib + project status summary.
+function Show-AssetLibStatus {
+    $config   = Get-AssetLibConfig
+    $packs    = Get-AssetPackManifest
+    $licenses = Get-AssetLicenseManifest
+
+    Write-Host "assetlib status" -ForegroundColor Cyan
+    Write-Host "----------------"
+
+    Write-Host "Script root:        $PSScriptRoot"
+    Write-Host "packs.json:         $manifestPath"
+    Write-Host "licenses manifest:  $licenseManifestPath"
+    Write-Host "config:             $configPath"
+
+    Write-Host ""
+    Write-Host "Config:"
+    Write-Host "  assetRootUrl:     $($config.assetRootUrl)"
+    Write-Host "  licenseMode:      $($config.licenseMode)"
+
+    Write-Host ""
+    Write-Host "Manifest:"
+    Write-Host "  packs count:      $($packs.Count)"
+    Write-Host "  licenses count:   $($licenses.Count)"
+
+    # Cache info
+    $cacheRoot = Join-Path $env:LOCALAPPDATA "assetlib\cache"
+    Write-Host ""
+    Write-Host "Cache:"
+    Write-Host "  root:             $cacheRoot"
+
+    if (Test-Path $cacheRoot) {
+        $cacheFiles = Get-ChildItem -Path $cacheRoot -File -ErrorAction SilentlyContinue
+        $cacheCount = $cacheFiles.Count
+        # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/measure-object
+        $cacheSizeBytes = ($cacheFiles | Measure-Object -Property Length -Sum).Sum
+        $cacheSizeMB = if ($cacheSizeBytes) { [math]::Round($cacheSizeBytes / 1MB, 2) } else { 0 }
+        Write-Host "  archives:         $cacheCount"
+        Write-Host "  size:             $cacheSizeMB MB"
+    }
+    else {
+        Write-Host "  (no cache directory yet)"
+    }
+
+    $projectRoot = Get-UnrealProjectRoot
+    Write-Host ""
+    Write-Host "Project:"
+    if (-not $projectRoot) {
+        Write-Host "  Not currently in an Unreal project root (no .uproject + Content/ found)."
+    }
+    else {
+        Write-Host "  root:             $projectRoot"
+
+        try {
+            $uprojectFiles = Get-ChildItem -Path $projectRoot -Filter *.uproject
+            if ($uprojectFiles.Count -ge 1) {
+                $uprojectPath = $uprojectFiles[0].FullName
+                $uprojectJson = Get-Content $uprojectPath -Raw | ConvertFrom-Json
+
+                $association = $uprojectJson.EngineVersion
+                if (-not $association) {
+                    $association = $uprojectJson.EngineAssociation
+                }
+
+                Write-Host "  .uproject:        $uprojectPath"
+                Write-Host "  EngineVersion:    $association"
+
+                if ($uprojectJson.Modules -and $uprojectJson.Modules.Count -gt 0) {
+                    Write-Host "  C++ modules:      yes (mixed C++ + Blueprints)"
+                }
+                else {
+                    Write-Host "  C++ modules:      no (Blueprint-only, unless manually converted later)"
+                }
+            }
+        }
+        catch {
+            Write-Warning "  Could not parse .uproject for additional status: $($_.Exception.Message)"
+        }
+
+        $editorRunning = Test-UnrealEditorRunning
+        Write-Host "  Unreal editor:    " -NoNewline
+        if ($editorRunning) {
+            Write-Host "appears to be RUNNING" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "not detected"
+        }
+    }
+}
+
+# Manage the local archive cache under %LOCALAPPDATA%\assetlib\cache.
+function Invoke-AssetLibCache {
+    param(
+        [string]$Action,
+        [switch]$Force
+    )
+
+    $cacheRoot = Join-Path $env:LOCALAPPDATA "assetlib\cache"
+
+    if (-not $Action) {
+        # Default: show cache info (same as status, but with more detail if needed).
+        Write-Host "assetlib cache" -ForegroundColor Cyan
+        Write-Host "--------------"
+        Write-Host "Cache root: $cacheRoot"
+
+        if (-not (Test-Path $cacheRoot)) {
+            Write-Host "No cache directory exists yet."
+            return
+        }
+
+        $files = Get-ChildItem -Path $cacheRoot -File -ErrorAction SilentlyContinue
+        $count = $files.Count
+        $sizeBytes = ($files | Measure-Object -Property Length -Sum).Sum
+        $sizeMB = if ($sizeBytes) { [math]::Round($sizeBytes / 1MB, 2) } else { 0 }
+
+        Write-Host "Archives:  $count"
+        Write-Host "Size:      $sizeMB MB"
+        return
+    }
+
+    if ($Action.ToLowerInvariant() -eq 'clear') {
+        Write-Host "assetlib cache clear" -ForegroundColor Cyan
+        Write-Host "---------------------"
+        Write-Host "Cache root: $cacheRoot"
+
+        if (-not (Test-Path $cacheRoot)) {
+            Write-Host "No cache directory exists; nothing to clear."
+            return
+        }
+
+        $files = Get-ChildItem -Path $cacheRoot -File -ErrorAction SilentlyContinue
+        $count = $files.Count
+        $sizeBytes = ($files | Measure-Object -Property Length -Sum).Sum
+        $sizeMB = if ($sizeBytes) { [math]::Round($sizeBytes / 1MB, 2) } else { 0 }
+
+        if ($count -eq 0) {
+            Write-Host "Cache is already empty."
+            return
+        }
+
+        Write-Host "This will delete $count cached archive(s) (~$sizeMB MB) from '$cacheRoot'." -ForegroundColor Yellow
+
+        if (-not $Force) {
+            $confirm = Read-Host "Proceed with clearing the cache? (Y/N) [N]"
+            if ($confirm -notmatch '^[Yy]') {
+                Write-Host "Cache clear cancelled."
+                return
+            }
+        }
+
+        try {
+            # Only delete the files inside, not the root folder itself.
+            Remove-Item -Path (Join-Path $cacheRoot '*') -Recurse -Force -ErrorAction Stop
+            Write-Host "Cache cleared." -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Failed to clear cache: $($_.Exception.Message)"
+        }
+
+        return
+    }
+
+    Write-Error "Unknown cache action '$Action'. Use 'assetlib cache' or 'assetlib cache clear [-Force]'."
+}
+
+# endregion Status & cache
+#==============================================================================
+
+#==============================================================================
+# region: Help
+#==============================================================================
 
 # Expanded, topic-aware help.
-# Supports:
-#   assetlib help
-#   assetlib help list
-#   assetlib help show
-#   assetlib help open
-#   assetlib help add
-#   assetlib help remove
-#   assetlib help licenses
-#   assetlib help audit
-#   assetlib help install
-#   assetlib help uninstall
-#   assetlib help mode
 function Show-AssetLibHelp {
+    <#
+    .SYNOPSIS
+        Show help for the assetlib tool.
+
+    .DESCRIPTION
+        Provides a high-level overview when called with no topic, or detailed
+        help for a specific command when called as:
+
+            assetlib help <command>
+
+        Example:
+
+            assetlib help install
+            assetlib help audit
+            assetlib help validate
+            assetlib help status
+            assetlib help cache
+    #>
     param(
         [string]$Topic
     )
 
-    # Normalize for matching.
-    $topicKey = $Topic
-    if ($topicKey) {
-        $topicKey = $topicKey.ToLowerInvariant()
+    if (-not $Topic) {
+@"
+assetlib - simple asset pack manifest helper
+--------------------------------------------
+
+Usage:
+  assetlib help
+  assetlib help <command>
+
+Commands:
+  help        Show this help, or detailed help for a specific command
+  list        List all packs (with optional category/tag filters)
+  show        Show full JSON for a specific pack
+  open        Open a pack's Google Drive folder in your browser
+  add         Add a new pack to packs.json (interactive)
+  remove      Remove a pack from packs.json (manifest only)
+  uninstall   Remove a pack from the CURRENT PROJECT only (files only)
+  licenses    List license definitions or show full text for one license
+  audit       Audit all packs for license safety; optionally prune installs
+  install     Install a pack into the current Unreal project (Content/ or Plugins/)
+  validate    Validate packs and (optionally) their archives in depth
+  mode        Show or change license mode (restrictive/permissive)
+  status      Show assetlib + project status summary (config, modes, cache)
+  cache       Inspect or clear the assetlib local archive cache
+
+Quick examples:
+  assetlib list
+  assetlib list -Category vfx
+  assetlib list -Tag sci-fi
+  assetlib show fab_scifi_soldier_pro_pack
+  assetlib open fab_scifi_soldier_pro_pack
+  assetlib add
+  assetlib remove fab_old_test_pack
+  assetlib uninstall fab_old_test_pack
+  assetlib licenses
+  assetlib licenses Fab_Standard_License
+  assetlib audit
+  assetlib audit -Prune -DryRun
+  assetlib install Mco_Mocap_Basics
+  assetlib install Mco_Mocap_Basics -Preview
+  assetlib validate Mco_Mocap_Basics -Deep
+  assetlib status
+  assetlib cache clear
+
+For detailed help on a specific command:
+  assetlib help install
+  assetlib help audit
+  assetlib help validate
+  assetlib help status
+  assetlib help cache
+"@ | Write-Host
+        return
     }
 
-    switch ($topicKey) {
-        # ---------------------------------------------------------------------
+    switch ($Topic.ToLower()) {
         "list" {
-            @"
+@"
 assetlib help list
 ------------------
 Usage:
-  assetlib list [-Category <category>] [-Tag <tag>]
+  assetlib list
+  assetlib list -Category <category>
+  assetlib list -Tag <tag>
 
 Description:
-  Lists packs from packs.json, optionally filtered by category and/or tag.
+  Lists packs from packs.json with optional filters:
+
+    -Category:
+        Filters by entries in the pack's categories array.
+        Example values: assets, animations, vfx, systems, plugin
+
+    -Tag:
+        Filters by entries in the pack's tags array.
 
 Examples:
   assetlib list
-  assetlib list -Category animations
+  assetlib list -Category vfx
   assetlib list -Tag sci-fi
-
-Details:
-  - Category and Tag are both optional.
-  - Categories and tags are arrays in packs.json.
-  - Under the hood, 'list' uses Where-Object to filter:
-      Where-Object { $_.categories -contains $Category }
-      Where-Object { $_.tags -contains $Tag }
 "@ | Write-Host
         }
-
-        # ---------------------------------------------------------------------
         "show" {
-            @"
+@"
 assetlib help show
 ------------------
 Usage:
   assetlib show <id>
 
 Description:
-  Prints the full JSON for a single pack from packs.json.
+  Prints the full JSON entry for a pack from packs.json.
+  This is useful for debugging pack fields like licenseId, archive_url,
+  engineVersion, packType, and pluginFolderName.
 
-Examples:
-  assetlib show Mco_Mocap_Basics
-
-Details:
-  - <id> must match the 'id' property of a pack in packs.json.
-  - Output is generated via ConvertTo-Json with a depth of 5, so you see:
-      - cloud_url
-      - archive_url
-      - categories
-      - tags
-      - licenseId
-      - packType
-      - pluginFolderName
+Example:
+  assetlib show fab_scifi_soldier_pro_pack
 "@ | Write-Host
         }
-
-        # ---------------------------------------------------------------------
         "open" {
-            @"
+@"
 assetlib help open
 ------------------
 Usage:
   assetlib open <id>
 
 Description:
-  Opens the pack's cloud_url in your default browser.
+  Opens the pack's cloud_url in your default browser. Typically this is a
+  Google Drive folder URL where the asset pack lives.
 
-Examples:
-  assetlib open Mco_Mocap_Basics
+Notes:
+  - cloud_url is meant for human-friendly browsing (folder view).
+  - archive_url is used by 'assetlib install' for direct downloads (zip).
 
-Details:
-  - <id> must match the 'id' in packs.json.
-  - cloud_url is expected to be a Google Drive folder view link.
-  - The URL is opened using Start-Process, which launches the default browser.
+Example:
+  assetlib open fab_scifi_soldier_pro_pack
 "@ | Write-Host
         }
-
-        # ---------------------------------------------------------------------
         "add" {
-            @"
+@"
 assetlib help add
 -----------------
 Usage:
   assetlib add
 
 Description:
-  Interactive wizard to add a new pack to packs.json.
+  Starts an interactive flow to add a new pack to packs.json. You will be
+  prompted for:
 
-What it does:
-  - Optionally opens the asset store root from assetlib.config.json.
-  - Prompts for:
-      id, name, source
-      cloud_url (folder view / Google Drive)
-      archive_url (direct download ZIP, used by 'install')
-      categories (comma-separated)
-      tags (comma-separated)
-      notes
-      licenseId
-      packType (content/plugin)
-      pluginFolderName (for plugins)
-  - Applies license rules based on licenseMode from assetlib.config.json:
-      restrictive : only 'OK' licenses allowed (commercialAllowed = true).
-      permissive  : allows all, but warns on NON-COMMERCIAL/UNKNOWN/NO-LICENSE.
+    - id
+    - name
+    - source (e.g. Fab, Quixel, Self)
+    - cloud_url (Google Drive folder URL)
+    - archive_url (direct download URL or Drive FILE URL)
+    - categories (comma-separated)
+    - tags (comma-separated)
+    - notes
+    - engineVersion (optional, e.g. 5.3)
+    - packType (content or plugin)
+    - pluginFolderName (for plugins)
+    - licenseId (must match licenses/licenses.json)
 
-Notes:
-  - This command only edits packs.json and does not touch any Unreal project.
-  - Safe to run while Unreal Editor is open.
+archive_url behavior:
+  - You can paste either:
+      - A Google Drive FILE URL (file/d/<id>/view?usp=sharing), or
+      - A prebuilt direct download URL, or
+      - Another host (S3, itch.io, etc.).
+  - For Drive file URLs, assetlib converts them into a direct download form
+    automatically so you don’t have to extract the FILE ID manually.
+
+License enforcement:
+  - licenseMode = restrictive:
+      - Refuses to add packs whose license status is:
+          - NON-COMMERCIAL
+          - UNKNOWN-LICENSE
+          - NO-LICENSE
+  - licenseMode = permissive:
+      - Allows adding all packs but prints warnings for the above statuses.
+
+Engine metadata:
+  - engineVersion is optional metadata used by 'install' for soft warnings
+    on content packs and plugins (e.g. "built/tested on 5.3").
+
+Plugin metadata:
+  - packType = content (default) or plugin.
+  - If packType = plugin, you can specify pluginFolderName (defaults to id),
+    which determines the folder under Project/Plugins/ where it is installed.
+
+Example:
+  assetlib add
 "@ | Write-Host
         }
-
-        # ---------------------------------------------------------------------
         "remove" {
-            @"
+@"
 assetlib help remove
 --------------------
 Usage:
-  assetlib remove <id> [-Force]
+  assetlib remove <id>
 
 Description:
-  Removes a pack entry from packs.json only. Does NOT touch any project files
-  or Google Drive content.
+  Removes a pack from packs.json. This does NOT delete any files from your
+  local Unreal project or from Google Drive; it only removes the manifest
+  entry.
 
-Examples:
-  assetlib remove Mco_Mocap_Basics
-  assetlib remove Mco_Mocap_Basics -Force
-
-Details:
-  - Without -Force:
-      - You are prompted to confirm removal.
-  - With -Force:
-      - The confirmation prompt is skipped.
-  - This is manifest maintenance only, safe with Unreal open.
+Example:
+  assetlib remove fab_old_test_pack
 "@ | Write-Host
         }
+        "uninstall" {
+@"
+assetlib help uninstall
+-----------------------
+Usage:
+  assetlib uninstall <id> [-Force]
 
-        # ---------------------------------------------------------------------
+Description:
+  Removes a pack's installed files from the CURRENT Unreal project, without
+  touching packs.json. The install location is inferred from packType:
+
+    packType = content :  Content/AssetLib/<id>/
+    packType = plugin  :  Plugins/<pluginFolderName or id>/
+
+Behavior:
+  - Must be run from an Unreal project root (folder with a .uproject + Content/).
+  - If the target folder does not exist, nothing is deleted.
+  - Without -Force:
+      - You are prompted before deleting the folder.
+  - With -Force:
+      - The folder is removed without prompting.
+
+Editor safety:
+  - If Unreal Editor appears to be running:
+      - Without -Force:
+          - Uninstall is blocked; you are asked to close the editor.
+      - With -Force:
+          - A warning is shown and uninstall continues.
+
+Example:
+  assetlib uninstall Mco_Mocap_Basics
+  assetlib uninstall Mco_Mocap_Basics -Force
+"@ | Write-Host
+        }
         "licenses" {
-            @"
+@"
 assetlib help licenses
 ----------------------
 Usage:
@@ -1554,41 +1981,84 @@ Usage:
   assetlib licenses <licenseId>
 
 Description:
-  Manages viewing of license metadata and text.
+  - Without arguments:
+      Lists all license definitions in licenses/licenses.json, including
+      whether each one is marked as commercialAllowed (COMMERCIAL vs
+      NON-COMMERCIAL).
+  - With a licenseId:
+      Prints details and the full text of the associated license .txt file.
 
+Examples:
   assetlib licenses
-    - Lists all license definitions from licenses/licenses.json.
-    - Shows id, COMMERCIAL/NON-COMMERCIAL status, and name.
-
-  assetlib licenses <licenseId>
-    - Shows details for a specific license and prints the full text of the
-      associated .txt file.
-
-Notes:
-  - This command is read-only and safe with Unreal open.
-  - License enforcement for 'add', 'install', and 'audit -Prune' is based on:
-      licenseId matching licenses/licenses.json
-      commercialAllowed flag in each license entry.
+  assetlib licenses Fab_Standard_License
 "@ | Write-Host
         }
+        "audit" {
+@"
+assetlib help audit
+-------------------
+Usage:
+  assetlib audit
+  assetlib audit -Prune [-DryRun] [-PruneStatus <status1,status2,...>]
 
-        # ---------------------------------------------------------------------
+Description:
+  'assetlib audit' without any flags:
+    - Prints a license audit report for all packs in packs.json, classifying
+      each as:
+        - OK
+        - NON-COMMERCIAL
+        - UNKNOWN-LICENSE
+        - NO-LICENSE
+
+  'assetlib audit -Prune':
+    - Must be run from an Unreal project root.
+    - Removes installed pack directories under the project root whose
+      pack license status matches the configured prune status set.
+    - By default, the statuses removed are:
+        - NON-COMMERCIAL
+        - UNKNOWN-LICENSE
+        - NO-LICENSE
+    - Only removes the installed directories (e.g. Content/AssetLib/<id>),
+      never edit packs.json.
+
+Options:
+  -PruneStatus:
+    - Comma-separated list of statuses to remove instead of the defaults.
+    - Valid statuses: OK, NON-COMMERCIAL, UNKNOWN-LICENSE, NO-LICENSE
+    - Example:
+        assetlib audit -Prune -PruneStatus NON-COMMERCIAL,UNKNOWN-LICENSE
+
+  -DryRun:
+    - Prints which directories WOULD be removed, but does not delete anything.
+
+Editor safety:
+  - Recommended: close Unreal Editor before pruning, especially for plugin
+    directories.
+
+Examples:
+  assetlib audit
+  assetlib audit -Prune -DryRun
+  assetlib audit -Prune
+  assetlib audit -Prune -PruneStatus NON-COMMERCIAL,UNKNOWN-LICENSE
+"@ | Write-Host
+        }
         "install" {
-            @"
+@"
 assetlib help install
 ---------------------
 Usage:
-  assetlib install <id> [-Force]
+  assetlib install <id> [-Force] [-Preview]
 
 Description:
   Installs a pack into the current Unreal project root by:
-    - Downloading archive_url from packs.json (with a progress bar)
+
+    - Downloading archive_url from packs.json (with a progress bar + cache)
     - Extracting it into:
         packType = content :  Content/AssetLib/<id>/
         packType = plugin  :  Plugins/<pluginFolderName or id>/
 
 Requirements:
-  - You must run this from an Unreal project root:
+  - Must be run from an Unreal project root:
       - Directory contains at least one *.uproject
       - Directory contains a Content/ folder
   - The pack must exist in packs.json.
@@ -1599,35 +2069,38 @@ License behavior:
       - Only installs packs whose license status is 'OK'
         (licenseId known and commercialAllowed = true).
   - licenseMode = permissive:
-      - Installs anything but warns on NON-COMMERCIAL/UNKNOWN/NO-LICENSE.
+      - Installs anything but warns on NON-COMMERCIAL, UNKNOWN-LICENSE,
+        and NO-LICENSE entries.
 
-Engine compatibility:
+Engine compatibility (plugins):
   - For plugins (packType=plugin):
       - The .uplugin file is inspected for EngineVersion.
       - The .uproject is inspected for EngineVersion / EngineAssociation.
       - Major-version mismatch (e.g. plugin 4.x vs project 5.x):
           - INSTALL IS BLOCKED by default; -Force is required to override.
-      - Plugin newer than project (5.4 plugin on 5.3 project):
-          - INSTALL IS BLOCKED by default; -Force is required.
-      - Plugin older than project (5.2 plugin on 5.3 project):
-          - INSTALL IS BLOCKED by default; -Force is required, with a warning that
-            many plugins do work across minor upgrades but must be tested.
+      - Plugin newer than project (e.g. 5.4 plugin on 5.3 project):
+          - INSTALL IS BLOCKED by default; -Force is required to override.
+      - Plugin older than project (e.g. 5.2 plugin on 5.3 project):
+          - INSTALL IS BLOCKED by default; -Force is required to override,
+            with a warning that many plugins do work on newer minor versions
+            but must be tested.
 
+Engine compatibility (content):
   - For content packs (packType=content):
-      - Optional engineVersion metadata in packs.json (e.g. "5.3") is used for
-        soft warnings if it does not match the project engine. Content is often
+      - Optional engineVersion in packs.json (e.g. "5.3") is used for soft
+        warnings if it does not match the project engine. Content is often
         portable across minor versions, so installs are not blocked.
 
 C++ vs Blueprint-only projects:
-  - If a plugin has C++ modules (Modules array in .uplugin) and the .uproject
-    has no Modules (Blueprint-only project), assetlib prints a warning that
-    the project may need to be converted to C++ (e.g. by adding a C++ class)
-    for the plugin to fully work.
+  - If a plugin has C++ modules (Modules array in its .uplugin) and the
+    .uproject has no Modules (Blueprint-only project), assetlib prints a
+    warning that the project may need to be converted to C++ (e.g. by
+    adding a C++ class) for the plugin to fully work.
 
-Engine-level plugins:
-  - Some plugin zips are structured for Engine-level install, containing paths
-    like 'Engine/Plugins/...'.
-  - assetlib DOES NOT SUPPORT engine-level plugin installs at all.
+Engine-level plugins (BLOCKED):
+  - Some plugin zips are structured for Engine-level installs and contain
+    paths like 'Engine/Plugins/...'.
+  - assetlib DOES NOT support installing engine-level plugins at all.
       - When such a package is detected:
           - The install is hard-blocked (no -Force override).
           - You are prompted to:
@@ -1637,128 +2110,95 @@ Engine-level plugins:
 
 Editor safety:
   - If Unreal Editor is running:
-      - Without -Force: install is blocked and you are asked to close the editor.
-      - With -Force   : a warning is shown and install proceeds anyway.
+      - Without -Force:
+          - Install is blocked; you are asked to close the editor.
+      - With -Force:
+          - A warning is shown and the install continues.
   - Recommended: close Unreal before installing, especially for plugins.
 
 Overwrite behavior:
-  - If target folder already exists:
+  - If the target folder already exists:
       - Without -Force:
           - You are prompted before removing the existing folder.
       - With -Force:
           - Existing folder is removed without prompting.
 
-ZIP handling & structure:
-  - The download is validated as a ZIP (checks for 'PK' header).
-  - Archives are extracted to a temporary folder first.
-  - If the archive contains exactly one top-level folder and no files, that
-    folder is treated as a wrapper and its CONTENTS are moved into the final
-    target path to avoid double-nesting:
-      Content/AssetLib/<id>/<id>/<content> -> Content/AssetLib/<id>/<content>
-  - Otherwise, all top-level entries in the archive are moved into the target
-    path as-is.
+Preview mode:
+  - 'assetlib install <id> -Preview' runs the full validation pipeline but
+    does NOT modify your project files:
+      - Uses (and/or downloads) the archive.
+      - Validates it as a ZIP.
+      - Extracts it into a temporary folder.
+      - Runs plugin engine checks and C++ vs Blueprint-only warnings.
+      - Shows how the archive would be laid out in the target path and
+        whether flattening would occur.
+  - No changes are made to Content/ or Plugins/ in Preview mode.
 
-Progress:
-  - The download step uses a streaming HTTP client and Write-Progress to show
-    a progress bar in the terminal as bytes are downloaded.
+Local cache:
+  - Downloaded archives are cached under:
+        %LOCALAPPDATA%\assetlib\cache\<id>.zip
+  - On subsequent installs, you can:
+      - Reuse the cached file (default), or
+      - Force a re-download with -Force.
+
+Download progress:
+  - The download uses a streaming HTTP client and Write-Progress to show a
+    progress bar in the terminal.
+
+ZIP/API references:
+  Invoke-WebRequest / HttpClient:
+    https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/invoke-webrequest
+    https://learn.microsoft.com/dotnet/api/system.net.http.httpclient
+  Expand-Archive:
+    https://learn.microsoft.com/powershell/module/microsoft.powershell.archive/expand-archive
+  Write-Progress:
+    https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/write-progress
+
+Examples:
+  assetlib install Mco_Mocap_Basics
+  assetlib install Mco_Mocap_Basics -Preview
+  assetlib install MyPluginPack -Force
 "@ | Write-Host
         }
-
-
-        # ---------------------------------------------------------------------
-        "uninstall" {
-            @"
-assetlib help uninstall
------------------------
+        "validate" {
+@"
+assetlib help validate
+----------------------
 Usage:
-  assetlib uninstall <id> [-Force]
+  assetlib validate <id> [-Deep]
+  assetlib validate --all [-Deep]
 
 Description:
-  Removes an installed pack from the current Unreal project by deleting the
-  folder where it was installed:
+  Quick mode (no -Deep):
+    - Shows manifest fields for each pack:
+        - id, name, source, packType, licenseId, licenseStatus
+        - engineVersion, archive_url presence
+    - Does NOT download archives or touch the filesystem.
 
-    packType = content :  Content/AssetLib/<id>/
-    packType = plugin  :  Plugins/<pluginFolderName or id>/
+  Deep mode (-Deep):
+    - Reuses 'assetlib install <id> -Preview' internally to:
+        - (Re)use cached archive or download it with progress
+        - Validate that it is a ZIP
+        - Extract into a temporary folder
+        - Run plugin engine checks and C++ vs Blueprint-only warnings
+        - Detect engine-level plugin packages (and block them)
+        - Preview the top-level directory structure and flattening behavior
+      - No project files are modified (no Content/ or Plugins/ changes).
 
-Requirements:
-  - Must be run from an Unreal project root (has *.uproject + Content/).
-  - The pack id must exist in packs.json.
-  - The computed install folder must exist to be removed.
+Notes:
+  - Deep validation requires network access and can take time.
+  - Deep validation is safest when run from an Unreal project root so that
+    engine compatibility can be compared with the .uproject.
 
-License:
-  - Licenses are NOT re-checked for uninstall; this is purely a project cleanup
-    operation.
-
-Editor safety:
-  - If Unreal Editor is running:
-      - Without -Force: uninstall is blocked with an error.
-      - With -Force   : a warning is printed and uninstall proceeds.
-  - Strongly recommended: close Unreal Editor before uninstalling to avoid
-    deleting in-use assets or plugins.
-
-Prompting:
-  - Without -Force:
-      - You are prompted before deleting the install folder.
-  - With -Force:
-      - Deletes without prompting.
+Examples:
+  assetlib validate Mco_Mocap_Basics
+  assetlib validate Mco_Mocap_Basics -Deep
+  assetlib validate --all
+  assetlib validate --all -Deep
 "@ | Write-Host
         }
-
-        # ---------------------------------------------------------------------
-        "audit" {
-            @"
-assetlib help audit
--------------------
-Usage:
-  assetlib audit
-  assetlib audit -Prune [-Licenses <id|NO-LICENSE|UNKNOWN-LICENSE> ...] [-Force]
-
-Description:
-  Read-only audit:
-    assetlib audit
-      - Classifies each pack as:
-          OK
-          NON-COMMERCIAL
-          UNKNOWN-LICENSE
-          NO-LICENSE
-      - DOES NOT delete anything.
-      - Safe to run with Unreal Editor open.
-
-  Prune mode (destructive, project-specific):
-    assetlib audit -Prune [...]
-      - Only allowed when:
-          licenseMode = 'restrictive'
-          current directory is an Unreal project root
-          Unreal Editor is not running (unless -Force)
-      - Deletes installed packs from THIS PROJECT ONLY based on license rules.
-
-Default prune behavior (no -Licenses):
-  - Removes installed packs whose license status is NOT 'OK':
-      NON-COMMERCIAL, UNKNOWN-LICENSE, NO-LICENSE.
-
-Explicit prune selection with -Licenses:
-  - Removes only installed packs whose license matches one of:
-      - Named license ids (e.g. Fab_Standard_License)
-      - Special pseudo-ids:
-          NO-LICENSE      : packs with missing licenseId
-          UNKNOWN-LICENSE : packs whose licenseId is not in licenses.json
-
-Editor safety:
-  - If Unreal Editor is running:
-      - Without -Force: prune is blocked with an error.
-      - With -Force   : a warning is printed and prune proceeds.
-
-Prompts:
-  - Without -Force:
-      - Shows a list of installed packs to be removed and prompts for confirmation.
-  - With -Force:
-      - Skips confirmation.
-"@ | Write-Host
-        }
-
-        # ---------------------------------------------------------------------
         "mode" {
-            @"
+@"
 assetlib help mode
 ------------------
 Usage:
@@ -1767,135 +2207,142 @@ Usage:
   assetlib mode permissive
 
 Description:
-  Manages the global licenseMode stored in assetlib.config.json.
+  Shows or sets the assetlib license mode:
 
+    restrictive :
+      - Only packs with status 'OK' (licenseId known, commercialAllowed = true)
+        are allowed for add/install.
+      - 'assetlib add' will REFUSE to add NON-COMMERCIAL, UNKNOWN-LICENSE, or
+        NO-LICENSE packs.
+      - 'assetlib install' will REFUSE to install the same statuses.
+
+    permissive  :
+      - All packs can be added/installed, but license issues are still
+        surfaced by 'assetlib audit', and warnings are printed when adding
+        or installing NON-COMMERCIAL / UNKNOWN-LICENSE / NO-LICENSE packs.
+      - Use this mode for prototype projects, non-commercial experiments,
+        or when you explicitly want to track content you cannot ship.
+
+Examples:
   assetlib mode
-    - Shows the current license mode and a short explanation.
-
   assetlib mode restrictive
-    - Sets licenseMode to 'restrictive'.
-    - Effects:
-        - 'add' only accepts packs with OK licenses.
-        - 'install' only installs packs with OK licenses.
-        - 'audit -Prune' is allowed (and required for pruning).
-
   assetlib mode permissive
-    - Sets licenseMode to 'permissive'.
-    - Effects:
-        - 'add' and 'install' allow any license but warn on problematic ones.
-        - 'audit -Prune' is disabled for safety.
 "@ | Write-Host
         }
+        "status" {
+@"
+assetlib help status
+--------------------
+Usage:
+  assetlib status
 
-        # ---------------------------------------------------------------------
-        default {
-            @"
-assetlib - shared asset pack manifest & Unreal helper
-=====================================================
+Description:
+  Shows a quick status overview for assetlib and (when run from an Unreal
+  project root) the current project:
 
-Overview
---------
-assetlib is a small PowerShell tool that:
+  Possible information:
+    - assetlib script root (PSScriptRoot)
+    - paths to packs.json, licenses.json, and assetlib.config.json
+    - Current licenseMode (restrictive or permissive)
+    - Number of packs and license definitions loaded
+    - Local cache root: %LOCALAPPDATA%\assetlib\cache
+    - Approximate cache size and number of cached archives
+    - If in an Unreal project:
+        - The detected .uproject file
+        - The project engine version (EngineVersion / EngineAssociation)
+        - Whether the project has C++ modules (mixed C++ + Blueprints)
+        - Whether Unreal Editor appears to be running
 
-  - Tracks asset packs in packs.json
-  - Stores license metadata in licenses/licenses.json
-  - Opens Google Drive folders for packs
-  - Installs/uninstalls packs into an Unreal project
-  - Audits and prunes installed packs based on license rules
-  - Enforces a configurable license mode: restrictive or permissive
+Notes:
+  - This command is intended as a quick “sanity check” to see if assetlib
+    is installed correctly and to verify which modes/settings are active.
+"@ | Write-Host
+        }
+        "cache" {
+@"
+assetlib help cache
+-------------------
+Usage:
+  assetlib cache
+  assetlib cache clear
+  assetlib cache clear -Force
 
-By design:
-  - ZERO dependencies beyond PowerShell and built-in modules.
-  - Friendly for non-technical teammates (copy/paste commands).
-  - NEVER edits Unreal engine folders, only the current project.
+Description:
+  Manages the local archive cache used by 'assetlib install' and
+  'assetlib validate -Deep'. Cached archives are stored under:
 
-IMPORTANT:
-  - Calling 'assetlib' with no arguments throws:
-      assetlib requires a command. Run 'assetlib help' for usage.
+    %LOCALAPPDATA%\assetlib\cache
 
-Quick command summary
----------------------
+  'assetlib cache' (no arguments):
+    - Shows:
+        - Cache root path
+        - Number of cached archives
+        - Approximate total size on disk
+
+  'assetlib cache clear':
+    - Deletes cached archives from the cache directory.
+    - Without -Force:
+        - Prompts before deleting.
+    - With -Force:
+        - Clears the cache without prompting.
+
+Notes:
+  - The cache is safe to delete at any time; it just means future installs
+    or deep validations will need to re-download archives.
+  - Does NOT affect packs.json or any project files.
+
+Examples:
+  assetlib cache
+  assetlib cache clear
+  assetlib cache clear -Force
+"@ | Write-Host
+        }
+        "help" {
+@"
+assetlib help help
+------------------
+Usage:
   assetlib help
   assetlib help <command>
 
-  assetlib list [-Category <category>] [-Tag <tag>]
-  assetlib show <id>
-  assetlib open <id>
+Description:
+  Shows either:
+    - A high-level overview of all commands (no arguments)
+    - Detailed documentation for a specific command (with topic)
 
-  assetlib add
-  assetlib remove <id> [-Force]
-
-  assetlib licenses [<licenseId>]
-
-  assetlib install <id> [-Force]
-  assetlib uninstall <id> [-Force]
-
-  assetlib audit
-  assetlib audit -Prune [-Licenses <id|NO-LICENSE|UNKNOWN-LICENSE> ...] [-Force]
-
-  assetlib mode
-  assetlib mode restrictive
-  assetlib mode permissive
-
-Editor safety
--------------
-Commands that ONLY read or edit JSON/config are safe while Unreal Editor is open:
-
-  - help, list, show, open
-  - add, remove
-  - licenses
-  - audit (without -Prune)
-  - mode
-
-Commands that modify a project (Content/ or Plugins/) are editor-sensitive:
-
-  - install, uninstall, audit -Prune
-
-For those, assetlib:
-
-  - Detects Unreal Editor processes (UnrealEditor*, UE4Editor, UE5Editor).
-  - Blocks operations when the editor appears to be running, unless -Force is used.
-  - With -Force, prints a warning and proceeds.
-
-Recommended workflow
---------------------
-  - Use 'assetlib add' and 'assetlib remove' to maintain packs.json.
-  - Use 'assetlib licenses' to understand license definitions.
-  - Use 'assetlib mode' to switch between restrictive and permissive license behavior.
-  - Before shipping:
-      - Run 'assetlib audit' to check license health.
-  - For a specific Unreal project:
-      - Close Unreal Editor.
-      - From the project root:
-          - Use 'assetlib install <id>' to bring in new content/plugins.
-          - Use 'assetlib uninstall <id>' to remove a specific pack.
-          - Use 'assetlib audit -Prune' to clean out non-commercial/unknown/no-license
-            packs from THIS PROJECT ONLY.
-
-For detailed help on any command:
-  - assetlib help list
-  - assetlib help show
-  - assetlib help open
-  - assetlib help add
-  - assetlib help remove
-  - assetlib help licenses
-  - assetlib help install
-  - assetlib help uninstall
-  - assetlib help audit
-  - assetlib help mode
+Examples:
+  assetlib help
+  assetlib help install
+  assetlib help audit
+  assetlib help validate
+  assetlib help status
+  assetlib help cache
 "@ | Write-Host
+        }
+        default {
+            Write-Host "Unknown help topic: '$Topic'. Showing general help instead." -ForegroundColor Yellow
+            Show-AssetLibHelp
         }
     }
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Help
+#==============================================================================
 
-# region: Top-level dispatcher -------------------------------------------------
+#==============================================================================
+# region: Top-level dispatcher
+#==============================================================================
 
 try {
     switch ($Command) {
-        "help" { Show-AssetLibHelp -Topic $Id }
-        "list" { Get-AssetPackList -Category $Category -Tag $Tag }
+        "help" {
+            Show-AssetLibHelp -Topic $Id
+        }
+
+        "list" {
+            Get-AssetPackList -Category $Category -Tag $Tag
+        }
+
         "show" {
             if (-not $Id) {
                 Write-Error "You must provide an id, e.g. assetlib show Mco_Mocap_Basics"
@@ -1904,6 +2351,7 @@ try {
                 Get-AssetPack -Id $Id
             }
         }
+
         "open" {
             if (-not $Id) {
                 Write-Error "You must provide an id, e.g. assetlib open Mco_Mocap_Basics"
@@ -1912,7 +2360,11 @@ try {
                 Open-AssetPack -Id $Id
             }
         }
-        "add" { Add-AssetPack }
+
+        "add" {
+            Add-AssetPack
+        }
+
         "remove" {
             if (-not $Id) {
                 Write-Error "You must provide an id, e.g. assetlib remove Mco_Mocap_Basics"
@@ -1921,25 +2373,7 @@ try {
                 Remove-AssetPack -Id $Id -Force:$Force
             }
         }
-        "licenses" {
-            if ($Id) {
-                Get-AssetLicense -Id $Id
-            }
-            else {
-                Get-AssetLicenseList
-            }
-        }
-        "audit" {
-            Test-AssetPackLicenses -Prune:$Prune -Licenses $Licenses -Force:$Force
-        }
-        "install" {
-            if (-not $Id) {
-                Write-Error "You must provide an id, e.g. assetlib install Mco_Mocap_Basics"
-            }
-            else {
-                Install-AssetPack -Id $Id -Force:$Force
-            }
-        }
+
         "uninstall" {
             if (-not $Id) {
                 Write-Error "You must provide an id, e.g. assetlib uninstall Mco_Mocap_Basics"
@@ -1948,9 +2382,70 @@ try {
                 Uninstall-AssetPackFromProject -Id $Id -Force:$Force
             }
         }
+
+        "licenses" {
+            if ($Id) {
+                Get-AssetLicense -Id $Id
+            }
+            else {
+                Get-AssetLicenseList
+            }
+        }
+
+        "audit" {
+            # Always run the standard license audit report.
+            Test-AssetPackLicenses | Out-Null
+
+            if ($Prune) {
+                $statuses = if ($PruneStatus -and $PruneStatus.Count -gt 0) {
+                    $PruneStatus
+                }
+                else {
+                    @("NON-COMMERCIAL", "UNKNOWN-LICENSE", "NO-LICENSE")
+                }
+
+                Invoke-AssetPackPrune -StatusesToRemove $statuses -DryRun:$DryRun
+            }
+        }
+
+        "install" {
+            if (-not $Id) {
+                Write-Error "You must provide an id, e.g. assetlib install Mco_Mocap_Basics"
+            }
+            else {
+                Install-AssetPack -Id $Id -Force:$Force -Preview:$Preview
+            }
+        }
+
         "mode" {
             GetSet-AssetLibMode -Mode $Id
         }
+
+        "status" {
+            Show-AssetLibStatus
+        }
+
+        "cache" {
+            if ($Id) {
+                Invoke-AssetLibCache -Action $Id -Force:$Force
+            }
+            else {
+                Invoke-AssetLibCache
+            }
+        }
+
+        "validate" {
+            if ($All) {
+                Invoke-AssetPackValidateAll -Deep:$Deep
+            }
+            elseif ($Id) {
+                Invoke-AssetPackValidate -Id $Id -Deep:$Deep
+            }
+            else {
+                Write-Host "Usage: assetlib validate <id> [-Deep]  OR  assetlib validate --all [-Deep]" -ForegroundColor Yellow
+            }
+        }
+
         default {
             Write-Error "Unknown command: $Command"
         }
@@ -1962,4 +2457,5 @@ catch {
     throw
 }
 
-# endregion --------------------------------------------------------------------
+# endregion Top-level dispatcher
+#==============================================================================
