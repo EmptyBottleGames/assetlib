@@ -1,15 +1,46 @@
 [
-  {
-    "id": "Mco_Mocap_Basics",
-    "name": "MCO Mocap Basics",
-    "source": "Fab",
-    "cloud_url": "https://drive.google.com/drive/folders/1Nnx8on35Pk1Wy7koElMylaflvBTK2B7j?usp=drive_link",
-    "archive_url": "https://drive.google.com/uc?export=download&id=1aSTvD93Oa6ptHj7oYRxxI-BjqMvMWEGl",
-    "categories": ["animations"],
-    "tags": ["mocap"],
-    "notes": "",
-    "licenseId": "Fab_Standard_License",
-    "packType": "content",
-    "pluginFolderName": null
-  }
+    {
+        "id": "Mco_Mocap_Basics",
+        "name": "MCO Mocap Basics",
+        "source": "Fab",
+        "cloud_url": "https://drive.google.com/drive/folders/1Nnx8on35Pk1Wy7koElMylaflvBTK2B7j?usp=drive_link",
+        "archive_url": "https://drive.google.com/uc?export=download&id=1aSTvD93Oa6ptHj7oYRxxI-BjqMvMWEGl",
+        "categories": [
+            "animations"
+        ],
+        "tags": [
+            "mocap"
+        ],
+        "notes": "",
+        "licenseId": "Fab_Standard_License",
+        "packType": "content",
+        "pluginFolderName": null
+    },
+    {
+        "id": "Industry_Props_Pack_6",
+        "name": "Industry Props Pack 6",
+        "source": "Fab",
+        "cloud_url": "https://drive.google.com/drive/folders/1_1af3YDe-pcgNTf7Z0zT3Ar12oeHnIdn?usp=drive_link",
+        "archive_url": "https://drive.google.com/uc?export=download\u0026id=1PbV0ldda3GBFG0bJo4cRFOJOrM3HV6td",
+        "categories": [
+            "3D",
+            "Tools",
+            "Objects",
+            "Decor",
+            "Storage",
+            "Containers",
+            "Meshes"
+        ],
+        "tags": [
+            "Tools",
+            "Objects",
+            "Decor",
+            "Storage",
+            "Containers"
+        ],
+        "notes": "High quality props pack, for the creation industrial environment, stores, etc.",
+        "licenseId": "Fab_Standard_License",
+        "packType": "content",
+        "pluginFolderName": null
+    }
 ]
