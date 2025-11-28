@@ -86,6 +86,42 @@ function Set-AssetLibConfig {
 
 # endregion --------------------------------------------------------------------
 
+# region: Misc helpers ---------------------------------------------------------
+
+function Select-PathZipOrFolder {
+    Add-Type -AssemblyName System.Windows.Forms
+
+    # Create the dialog
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+
+    # Allow folder selection by using a dummy filename
+    $dialog.CheckFileExists = $false
+    $dialog.ValidateNames = $false
+    $dialog.Multiselect = $false
+    $dialog.FileName = "Select Folder"
+
+    # Only show *.zip + folders
+    $dialog.Filter = "Zip Files (*.zip)|*.zip"
+
+    # Show the dialog
+    $result = $dialog.ShowDialog()
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+        return $null
+    }
+
+    # Detect if the user picked a folder
+    if ($dialog.FileName -eq "Select Folder") {
+        # Remove dummy part → get folder path
+        return Split-Path $dialog.FileName
+    }
+
+    # Otherwise user picked a .zip file → return it
+    return $dialog.FileName
+}
+
+
+# endregion --------------------------------------------------------------------
+
 # region: Manifest helpers -----------------------------------------------------
 
 function Get-AssetPackManifest {
@@ -174,7 +210,7 @@ function Get-AssetPackLicenseStatus {
 
 # region: MEGAcmd helpers ------------------------------------------------------
 
-# Minimal CLI availability check – used before we call mega-get.
+# Minimal CLI availability check - used before we call mega-get.
 function Test-MegaCmdCliAvailable {
     try {
         $null = mega-help 2>$null
@@ -467,32 +503,30 @@ function Add-AssetPack {
         Write-Error "A pack with id '$id' already exists."
         return
     }
-
-    $name   = Read-Host "name (nice human-readable name)"
+    
+    $nameFromId = $id -replace '_', ' '
+    $name   = Read-Host "name (nice human-readable name) [$nameFromId]"
+    if (-not $name) { $name = $nameFromId }
     $source = Read-Host "source (Fab/Quixel/Self/etc) [Fab]"
     if (-not $source) { $source = "Fab" }
 
-    # Open MEGA asset root in browser, so you can navigate to the pack folder/file.
-    $openRoot = Read-Host "Open asset store root in your browser now (MEGA)? (Y/N) [N]"
-    if ($openRoot -match '^[Yy]') {
-        $rootUrl = $config.assetRootUrl
-        if (-not $rootUrl) {
-            $rootUrl = "https://mega.nz/folder/<your-folder-id>#<your-key>"
+    $useDialog = Read-Host "Do you want to select the local folder or zip file to upload via a dialog? (Y/N) [N]"
+    if ($useDialog -match '^[Yy]') {
+        $uploadFilePath = Select-PathZipOrFolder
+        if (-not $uploadFilePath) {
+            Write-Error "No folder or zip file selected; cancelling."
+            return
         }
-        Write-Host "Opening $rootUrl..."
-        Start-Process $rootUrl
-        Write-Host "After preparing the pack on MEGA, copy the folder/file link and paste it below."
+        Write-Host "Selected: $uploadFilePath"
     }
-
+    else {
+        $uploadFilePath = Read-Host "Enter the full local path to folder or zip you want to upload. (Pack file path)"
+    }
+   
+    # TODO: This needs to be redone to get the cloud_url for the user.
     # MEGA folder/file link for human navigation.
-    $cloudUrl = Read-Host "MEGA folder or file URL for this pack (cloud_url)"
-
-    # archive_url: MEGA archive spec used by mega-get.
-    # This should typically be:
-    #   - a MEGA file URL to a .zip
-    #   - or a MEGA path (e.g. /Root/GameLibrary/Packs/<id>.zip)
-    $archiveUrl = Read-Host "MEGA archive spec used for install (archive_url – file URL or MEGA path to .zip)"
-
+    # $cloudUrl = Read-Host "MEGA folder or file URL for this pack (cloud_url)"
+    
     $catsRaw = Read-Host "categories (comma-separated: assets, animations, vfx, systems, tools, etc.)"
     $categories = @()
     if ($catsRaw) {
@@ -576,7 +610,7 @@ function Add-AssetPack {
         name             = $name
         source           = $source
         cloud_url        = $cloudUrl
-        archive_url      = $archiveUrl
+        uploadFilePath   = $archiveUrl
         categories       = $categories
         tags             = $tags
         notes            = $notes
