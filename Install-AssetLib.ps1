@@ -339,26 +339,29 @@ function Invoke-MegaCmdLoginWizard {
             mega-login <email> <password>
 
         Behavior:
-        - Skips entirely if MEGAcmd CLI is not available.
-        - Skips if already logged in.
-        - Prompts once to see if the user *wants* to log in.
-        - Then enters a retry loop:
-            * Asks for email + password
-            * Runs mega-login
-            * On failure, shows output and asks if they want to try again
-            * User can cancel at any prompt by pressing Enter or answering N
+        - Skips if MEGAcmd is not available.
+        - Skips if already logged in (per mega-session).
+        - Interactive login with retry loop:
+            * On failure, lets the user:
+                - [R]etry with same email
+                - [C]hange email and retry
+                - [S]kip / give up
+        - On successful CLI login:
+            * Prints email + password in the terminal.
+            * Opens https://mega.nz/login in the default browser.
+            * Waits for the user to press Enter so the credentials remain
+              the most recent terminal output while they log in via browser.
 
-        Notes:
-        - We prompt for a password using -AsSecureString so it doesn't echo,
-          then convert it briefly to plain text to pass to mega-login.
-        - The password string is cleared as soon as mega-login returns.
+        SECURITY NOTE:
+        - This wizard explicitly prints the password back to the terminal
+          *once*, assuming this is a trusted dev box.
     #>
 
     if (-not (Test-MegaCmdCliAvailable)) {
         Write-Warning "MEGAcmd CLI is not available (mega-help failed). Skipping login wizard."
         return
     }
-    
+
     # Check if already logged in
     $session = mega-session 2>$null
     if ($session -and $session -notmatch 'Not logged in') {
@@ -370,7 +373,7 @@ function Invoke-MegaCmdLoginWizard {
     Write-Host ""
     Write-Host "MEGAcmd login setup" -ForegroundColor Cyan
     Write-Host "------------------------------------------------------"
-    Write-Host "assetlib can use MEGAcmd to download packs from MEGA."
+    Write-Host "assetlib uses MEGAcmd to download packs from MEGA."
     Write-Host "You only need to log into MEGAcmd once per machine."
     Write-Host ""
     $answer = Read-Host "Would you like to log into MEGAcmd now? (Y/N) [Y]"
@@ -379,28 +382,24 @@ function Invoke-MegaCmdLoginWizard {
         return
     }
 
+    $maxAttempts = 5
+    $attempt     = 0
+    $email       = $null
+
     while ($true) {
-        # --- Email -----------------------------------------------------------
-        $email = Read-Host "MEGA account email (or press Enter to cancel)"
+        $attempt++
+
         if (-not $email) {
-            Write-Host "No email entered; cancelling MEGAcmd login wizard." -ForegroundColor Yellow
-            return
+            $email = Read-Host "MEGA account email"
+            if (-not $email) {
+                Write-Host "No email entered; skipping MEGAcmd login." -ForegroundColor Yellow
+                return
+            }
         }
 
-        # --- Password (SecureString) ----------------------------------------
-        $securePwd = Read-Host "MEGA account password (input will not echo; press Enter to cancel)" -AsSecureString
-
-        # If user just pressed Enter, SecureString may still exist but be empty - treat that as cancel.
-        $pwdLength = 0
-        try {
-            $pwdLength = $securePwd.Length
-        }
-        catch {
-            $pwdLength = 0
-        }
-
-        if (-not $securePwd -or $pwdLength -eq 0) {
-            Write-Host "No password entered; cancelling MEGAcmd login wizard." -ForegroundColor Yellow
+        $securePwd = Read-Host "MEGA account password (input will not echo)" -AsSecureString
+        if (-not $securePwd) {
+            Write-Host "No password entered; skipping MEGAcmd login." -ForegroundColor Yellow
             return
         }
 
@@ -413,54 +412,80 @@ function Invoke-MegaCmdLoginWizard {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
 
-        Write-Host ""
         Write-Host "Running 'mega-login $email ****' via MEGAcmd..." -ForegroundColor Cyan
 
         try {
-            $output = mega-login $email $plainPwd 2>&1
-            $exitCode = $?
+            $output  = mega-login $email $plainPwd 2>&1
+            $success = $?
         }
         catch {
-            $output = $_.Exception.Message
-            $exitCode = $false
+            $output  = $_.Exception.Message
+            $success = $false
         }
-        finally {
-            # Best-effort wipe of password string
+
+        if ($success) {
+            Write-Host ""
+            Write-Host "MEGAcmd CLI login appears to have succeeded." -ForegroundColor Green
+            Write-Host ""
+            Write-Host "Now let's also log you into MEGA in your browser so private links 'just work'." -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "Use the following credentials in the browser login form:" -ForegroundColor Cyan
+            Write-Host "  Email:    $email"
+            Write-Host "  Password: $plainPwd"
+            Write-Host ""
+            Write-Host "A MEGA login page will now open in your default browser." -ForegroundColor Cyan
+            Write-Host "1) Wait for the page to load." -ForegroundColor Cyan
+            Write-Host "2) Copy/paste the email & password from above into the login form." -ForegroundColor Cyan
+            Write-Host "3) Let the browser remember your login if you want." -ForegroundColor Cyan
+            Write-Host ""
+
+            Start-Process "https://mega.nz/login"
+
+            # Keep the credentials as the last thing on screen while they log in.
+            [void](Read-Host "After you've finished logging into MEGA in the browser, press Enter to continue...")
+
+            # Best-effort wipe of password string after we're done.
             $plainPwd = $null
-        }
-
-        if ($exitCode) {
-            Write-Host "MEGAcmd login appears to have succeeded." -ForegroundColor Green
-
-            # Optional: re-check session and show a short confirmation
-            $session = mega-session 2>$null
-            if ($session -and $session -notmatch 'Not logged in') {
-                Write-Host "Current session info: $session"
-            }
-
             return
         }
 
-        # Login failed - show output and offer retry / give up
+        # Login failed – clear the plain text password as soon as possible.
+        $plainPwd = $null
+
         Write-Warning @"
-MEGAcmd login returned a non-zero exit code ($exitCode).
+MEGAcmd login failed (attempt $attempt of $maxAttempts).
 
 Output:
 $output
 "@
 
-        $retry = Read-Host "Login failed. Try again? (Y/N) [Y]"
-        if ($retry -and $retry -notmatch '^[Yy]') {
-            Write-Host "Giving up on MEGAcmd login for now. You can try again later with:" -ForegroundColor Yellow
-            Write-Host "  mega-login"
+        if ($attempt -ge $maxAttempts) {
+            Write-Warning "Maximum login attempts reached. You can retry later manually with: mega-login"
             return
         }
 
-        Write-Host ""
-        Write-Host "Let's try logging in again..." -ForegroundColor Cyan
-        Write-Host ""
+        Write-Host "What would you like to do next?" -ForegroundColor Yellow
+        Write-Host "  [R]etry with the same email"
+        Write-Host "  [C]hange email and retry"
+        Write-Host "  [S]kip / give up for now"
+        $choice = Read-Host "Choice [R/C/S] [R]"
+
+        if (-not $choice -or $choice -match '^[Rr]') {
+            # retry with same email
+            continue
+        }
+        elseif ($choice -match '^[Cc]') {
+            # change email and retry
+            $email = $null
+            continue
+        }
+        else {
+            Write-Host "Skipping MEGAcmd login for now. You can run 'mega-login' later." -ForegroundColor Yellow
+            return
+        }
     }
 }
+
 
 
 # -----------------------------------------------------------------------------
@@ -470,17 +495,17 @@ $output
 if (-not (Test-Path $configPath)) {
     Write-Host "Configuring asset store root URL for assetlib..." -ForegroundColor Cyan
 
-    $defaultRoot = "https://mega.nz/folder/<your-folder-id>#<your-key>"
-    Write-Host "Enter the root URL of your asset store (e.g. shared MEGA folder for all packs)."
-    Write-Host "Example (MEGA):  https://mega.nz/folder/<folder-id>#<key>"
-    $assetRootUrl = Read-Host "Asset store root URL [$defaultRoot]"
+    $defaultRoot = "/AssetLib"
+    Write-Host "Enter the MEGA remote folder root for asset store"
+    Write-Host "Example (MEGA):  /AssetLib"
+    $megaRootPath = Read-Host "Asset store root URL [$defaultRoot]"
 
-    if (-not $assetRootUrl) {
-        $assetRootUrl = $defaultRoot
+    if (-not $megaRootPath) {
+        $megaRootPath = $defaultRoot
     }
 
     $config = [pscustomobject]@{
-        assetRootUrl = $assetRootUrl
+        megaRootPath = $megaRootPath
         licenseMode  = "restrictive"  # default to safest mode
     }
 
@@ -506,6 +531,6 @@ Write-Host ""
 Write-Host "assetlib installation/update complete." -ForegroundColor Cyan
 Write-Host ""
 Write-Host "If you have issues with MEGAcmd or assetlib, it is recommended to:" -ForegroundColor Cyan
-Write-Host "Close and reopen PowerShell (so PATH/profile changes apply)."
+Write-Host "Close and reopen PowerShell (to ensure PATH/profile changes are detected)."
 Write-Host ""
 Write-Host "Profile file used: $PROFILE"
