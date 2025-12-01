@@ -112,7 +112,7 @@ function Select-PathZipOrFolder {
 
 function Show-DataTable {
     param([System.Data.DataTable]$Table)
-    $text = $Table | Format-Table -AutoSize -Wrap | Out-String
+    $text = $Table | Format-Table -AutoSize | Out-String
     Write-Host $text
 }
 
@@ -242,14 +242,14 @@ function Select-LocalPackPathFromProject {
 
 function Get-AssetPackManifest {
     if (-not (Test-Path $manifestPath)) {
-        return ,@()
+        return , @()
     }
     $json = Get-Content $manifestPath -Raw
     if (-not $json.Trim()) {
-        return ,@()
+        return , @()
     }
     $returnJson = $json | ConvertFrom-Json
-    return $returnJson ? $returnJson : ,@()
+    return $returnJson ? $returnJson : , @()
 }
 
 function Set-AssetPackManifest {
@@ -259,7 +259,7 @@ function Set-AssetPackManifest {
     )
 
     try {
-        ,$Packs |
+        , $Packs |
         ConvertTo-Json -Depth 5 |
         Set-Content -Path $manifestPath -Encoding UTF8
 
@@ -274,13 +274,14 @@ function Set-AssetPackManifest {
 function Get-AssetLicenseManifest {
     if (-not (Test-Path $licenseManifestPath)) {
         Write-Error "License manifest not found at $licenseManifestPath"
-        return ,@()
+        return , @()
     }
     $json = Get-Content $licenseManifestPath -Raw
     if (-not $json.Trim()) {
-        return ,@()
+        return , @()
     }
-    return $json | ConvertFrom-Json
+    $returnJson = $json | ConvertFrom-Json
+    return $returnJson ? $returnJson : , @()
 }
 
 function Get-AssetPackLicenseStatus {
@@ -303,7 +304,7 @@ function Get-AssetPackLicenseStatus {
     if (-not $lic) {
         return [pscustomobject]@{
             Status    = 'UNKNOWN-LICENSE'
-            License   = $null
+            License   = $licenseId -replace '_', ' '
             LicenseId = $licenseId
         }
     }
@@ -311,14 +312,14 @@ function Get-AssetPackLicenseStatus {
     if (-not $lic.commercialAllowed) {
         return [pscustomobject]@{
             Status    = 'NON-COMMERCIAL'
-            License   = $lic
+            License   = $lic.name
             LicenseId = $licenseId
         }
     }
 
     return [pscustomobject]@{
         Status    = 'OK'
-        License   = $lic
+        License   = $lic.name
         LicenseId = $licenseId
     }
 }
@@ -493,7 +494,7 @@ function Open-MegaFolderInBrowser {
     )
 
     if (-not (Test-MegaCmdCliAvailable)) {
-        Write-Error "MEGAcmd CLI does not appear to be available. Cannot generate export link."
+        Write-Host "MEGAcmd CLI does not appear to be available. Cannot generate export link." -ForegroundColor Red
         return
     }
 
@@ -501,7 +502,7 @@ function Open-MegaFolderInBrowser {
 
     $output = ""
     try {
-        $output = mega-export $RemoteFolder 2>&1
+        $output = mega-export -a $RemoteFolder 2>&1
         $exitOk = $?
     }
     catch {
@@ -511,49 +512,39 @@ function Open-MegaFolderInBrowser {
 
     if (-not $exitOk) {
         Write-Host $output
-        Write-Error "mega-export failed for '$RemoteFolder'."
+        Write-Host "mega-export failed for '$RemoteFolder'." -ForegroundColor Red
         return
     }
 
     # Try to find a URL in the output (MEGA-style link).
     $link = $null
-    $matches = [regex]::Matches($output, 'https://mega\.nz/\S+')
-    if ($matches.Count -gt 0) {
-        $link = $matches[0].Value
+    $_matches = [regex]::Matches($output, 'https://mega\.nz/\S+')
+    if ($_matches.Count -gt 0) {
+        $link = $_matches[0].Value
     }
 
     if (-not $link) {
         Write-Host $output
-        Write-Error "mega-export did not produce a recognizable MEGA URL."
+        Write-Host "mega-export did not produce a recognizable MEGA URL." -ForegroundColor Red
         return
     }
 
     Write-Host "Opening MEGA link in your default browser:" -ForegroundColor Green
     Write-Host "  $link"
     Start-Process $link
-
-    Write-Host ""
-    Write-Host "Once you're done with this link, you can choose to revoke it." -ForegroundColor Yellow
-    $answer = Read-Host "Press Enter to revoke this export link now, or type 'keep' to leave it active [Enter = revoke]"
-
-    if (-not $answer) {
-        Write-Host "Revoking export link for '$RemoteFolder' via mega-export -d ..." -ForegroundColor Yellow
-        try {
-            $outDel = mega-export -d $RemoteFolder 2>&1
-            if (-not $?) {
-                Write-Host $outDel
-                Write-Warning "mega-export -d did not succeed; export link may still be active."
-            }
-            else {
-                Write-Host "Export link revoked." -ForegroundColor Green
-            }
+    [void](Read-Host "Press Enter to continue after you've finished with the MEGA link")
+    try {
+        $outDel = mega-export -d $RemoteFolder 2>&1
+        if (-not $?) {
+            Write-Host $outDel -ForegroundColor Red
+            Write-Warning "mega-export -d did not succeed; export link may still be active."
         }
-        catch {
-            Write-Warning "Failed to revoke export link: $($_.Exception.Message)"
+        else {
+            Write-Host "Export link revoked." -ForegroundColor Green
         }
     }
-    else {
-        Write-Host "Keeping export link active as requested." -ForegroundColor Yellow
+    catch {
+        Write-Host "Failed to revoke export link: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
@@ -681,14 +672,23 @@ function Open-AssetPack {
 function Get-AssetLicenseList {
     $licenses = Get-AssetLicenseManifest
     if (-not $licenses -or $licenses.Count -eq 0) {
-        Write-Host "No licenses defined. Edit licenses/licenses.json to add licenses." -ForegroundColor Yellow
+        Write-Host "No licenses defined. Edit licenses/licenses.json to add licenses." -ForegroundColor Red
         return
     }
+    # Create a data table to display licenses
+    $table = New-Object System.Data.DataTable
+    $table.Columns.Add("Index") | Out-Null
+    $table.Columns.Add("Id") | Out-Null
+    $table.Columns.Add("Status") | Out-Null
+    $table.Columns.Add("Name") | Out-Null
 
-    foreach ($lic in $licenses) {
+    for ($i = 0; $i -lt $licenses.Count; $i++) {
+        $lic = $licenses[$i]
         $flag = if ($lic.commercialAllowed) { "COMMERCIAL" } else { "NON-COMMERCIAL" }
-        "{0,-30} {1,-15}  - {2}" -f $lic.id, "[$flag]", $lic.name
+        $table.Rows.Add($i, $lic.id, $flag, $lic.name) | Out-Null
     }
+    # Show the licenses table
+    Show-DataTable -Table $table
 }
 
 function Get-AssetLicense {
@@ -740,8 +740,8 @@ function Add-AssetPackHelper {
     
     # Define dummy object to store new pack data. We'll fill it in interactively.
     $interactivePackData = [PSCustomObject]@{
-        id     = $Id
-        name   = $Id -replace '_', ' '
+        id               = $Id
+        name             = $Id -replace '_', ' '
         uploadFolderPath = $UploadFolderPath
     }
 
@@ -750,7 +750,8 @@ function Add-AssetPackHelper {
         if (-not $interactivePackData.id) {
             $interactivePackData.id = $Id
         }
-    } else {
+    }
+    else {
         $interactivePackData.id = Read-Host "id (usually the folder name. e.g. fab_scifi_soldier_pro_pack)"
     }
 
@@ -785,7 +786,8 @@ function Add-AssetPackHelper {
         else {
             $interactivePackData.uploadFolderPath = Read-Host "Enter the full local path to the folder containing the pack content"
         }
-    } else {
+    }
+    else {
         $interactivePackData.uploadFolderPath = Read-Host "Enter the full local path to the pack folder [$($interactivePackData.uploadFolderPath)]"
         if (-not $interactivePackData.uploadFolderPath) {
             $interactivePackData.uploadFolderPath = $UploadFolderPath
@@ -884,24 +886,50 @@ function Add-AssetPack {
     $notes = Read-Host "notes (optional)"
 
     $engineVersion = Read-Host "engine version this pack/plugin was built/tested against (optional, e.g. 5.6 or a range like 5.0-5.7)"
-
-    Write-Host ""
-    Write-Host "Available licenses:" -ForegroundColor Cyan
-    Get-AssetLicenseList
-    Write-Host ""
-    $licenseId = Read-Host "license id (must match one of the IDs above)"
-
+    
+    $finished = $false
     $licStatus = [pscustomobject]@{
         Status    = 'NO-LICENSE'
         License   = $null
         LicenseId = $null
     }
-    if ($licenseId) {
-        $licStatus = Get-AssetPackLicenseStatus -Pack ([pscustomobject]@{ licenseId = $licenseId }) -Licenses $licenses
+    while (-not $finished) {
+        Write-Host ""
+        Write-Host "Available licenses:" -ForegroundColor Cyan
+        Get-AssetLicenseList
+        $licenseMode = $config.licenseMode
+        $licenseIndex = Read-Host $($licenseMode -eq "restrictive" ? "Enter the index of the license to assign to this pack" : "Enter the index of the license to assign to this pack (Leave blank for no license)")
+        # Guard against invalid input
+        if (-not $licenseIndex -and $licenseMode -eq 'restrictive') {
+            Write-Host "In restrictive mode, a license must be assigned." -ForegroundColor Red
+            continue
+        }
+        if (-not $licenseIndex -and $licenseMode -eq 'permissive') {
+            $finished = $true
+        }
+        if ($licenseIndex) {
+            if (-not [int]::TryParse($licenseIndex, [ref]$null) -or
+                [int]$licenseIndex -lt 0 -or
+                [int]$licenseIndex -ge $licenses.Count) {
+
+                Write-Host "Invalid index '$licenseIndex'" -ForegroundColor Red
+                continue
+            }
+            $licenseIndex = [int]$licenseIndex
+        }
+        try {
+            $lic = $licenses[$licenseIndex]
+            $finished = $true
+        }
+        catch {
+            continue
+        }
+        $licStatus = Get-AssetPackLicenseStatus -Pack ([pscustomobject]@{ 
+            licenseId = $lic.id
+            license   = $lic.name
+        }) -Licenses $licenses
+       
     }
-
-    $licenseMode = $config.licenseMode
-
     if ($licenseMode -eq 'restrictive') {
         switch ($licStatus.Status) {
             'NO-LICENSE' {
@@ -909,14 +937,14 @@ function Add-AssetPack {
                 return
             }
             'UNKNOWN-LICENSE' {
-                Write-Error "License id '$licenseId' not found in licenses/licenses.json (restrictive mode)."
+                Write-Error "License id '$($licStatus.License)' not found in licenses/licenses.json (restrictive mode)."
                 return
             }
             'NON-COMMERCIAL' {
-                Write-Error "License '$licenseId' is marked as NON-COMMERCIAL. This pack cannot be added in restrictive mode."
+                Write-Error "License '$($licStatus.License)' is marked as NON-COMMERCIAL. This pack cannot be added in restrictive mode."
                 return
             }
-            'OK' { }
+            'OK' { Write-Host "Selected license '$($licStatus.License)'" -ForegroundColor Green }
         }
     }
     else {
@@ -925,41 +953,41 @@ function Add-AssetPack {
                 Write-Warning "No licenseId provided; pack added in permissive mode but flagged as NO-LICENSE."
             }
             'UNKNOWN-LICENSE' {
-                Write-Warning "License id '$licenseId' not found in licenses/licenses.json; pack added in permissive mode but flagged as UNKNOWN-LICENSE."
+                Write-Warning "License '$($licStatus.License)' not found in licenses/licenses.json; pack added in permissive mode but flagged as UNKNOWN-LICENSE."
             }
             'NON-COMMERCIAL' {
-                Write-Warning "License '$licenseId' is NON-COMMERCIAL; pack added in permissive mode but only safe for non-commercial contexts."
+                Write-Warning "License '$($licStatus.License)' is NON-COMMERCIAL; pack added in permissive mode but only safe for non-commercial contexts."
             }
-            'OK' { }
+            'OK' { Write-Host "Selected license '$($licStatus.License)'" -ForegroundColor Green }
         }
     }
 
     $packTypePromptDefault = $defaultPackType
-    $packType = Read-Host "pack type (content/plugin) [$packTypePromptDefault]"
+    $packType = Read-Host "pack type (content/plugin) [$($interactivePackData.defaultPackType ? $interactivePackData.defaultPackType : $defaultPackType)]"
     if (-not $packType) { $packType = $packTypePromptDefault }
 
     $pluginFolderName = $null
     if ($packType -eq 'plugin') {
-        $pluginFolderName = Read-Host "plugin folder name under Plugins/ (optional, default = id) [$id]"
-        if (-not $pluginFolderName) { $pluginFolderName = $id }
+        $pluginFolderName = Read-Host "plugin folder name under Plugins/ (optional) [$($interactivePackData.id)]"
+        if (-not $pluginFolderName) { $pluginFolderName = $interactivePackData.id }
     }
 
-    $megaSubPath = Read-Host "Remote MEGA subpath under root '$($config.megaRootPath)' (optional, default = $id)"
+    $megaSubPath = Read-Host "Remote MEGA subpath under root '$($config.megaRootPath)' (optional) [$($interactivePackData.id)]"
     if ($megaSubPath) {
         $megaSubPath = $megaSubPath.Trim('/')
     }
     if (-not $megaSubPath) {
-        $megaSubPath = $id
+        $megaSubPath = $interactivePackData.id
     }
 
     $newPack = [PSCustomObject]@{
         id               = $interactivePackData.id
-        name             = $name
+        name             = $interactivePackData.name
         source           = $source
         categories       = $categories
         tags             = $tags
         notes            = $notes
-        licenseId        = $licenseId
+        licenseId        = $lic.id
         packType         = $packType
         pluginFolderName = $pluginFolderName
         engineVersion    = $engineVersion
@@ -978,7 +1006,7 @@ function Add-AssetPack {
 
     $packs += $newPack
     Set-AssetPackManifest -Packs $packs
-    Write-Host "Added pack $id with license '$licenseId' in mode '$licenseMode'. Remote MEGA path: $remotePath" -ForegroundColor Green
+    Write-Host "Added pack $($interactivePackData.id) with license '$($lic.id)' in mode '$($config.licenseMode)'. Remote MEGA path: $remotePath" -ForegroundColor Green
 }
 
 function Remove-AssetPack {
@@ -991,7 +1019,7 @@ function Remove-AssetPack {
     $packs = Get-AssetPackManifest
     $before = $packs.Count
     $packToRemove = $packs | Where-Object { $_.id -eq $Id }
-    $remaining = ,$packs | Where-Object { $_.id -ne $Id }
+    $remaining = , $packs | Where-Object { $_.id -ne $Id }
     
     if ($remaining.Count -eq $before) {
         Write-Error "No pack found with id: $Id"
@@ -1025,7 +1053,8 @@ function Remove-AssetPack {
                 # check output for "No such file or directory" to avoid false warning
                 if ($output -notmatch 'No such file or directory') {
                     Write-Warning "mega-rm failed to remove MEGA folder for pack '$Id'. Error: $output"
-                } else {
+                }
+                else {
                     Write-Host "MEGA folder for pack '$Id' does not exist; nothing to remove." -ForegroundColor Cyan
                 }
             }
@@ -1038,7 +1067,7 @@ function Remove-AssetPack {
         }
     }
 
-    Set-AssetPackManifest -Packs $($remaining ? $remaining : ,@()) 
+    Set-AssetPackManifest -Packs $($remaining ? $remaining : , @()) 
     Write-Host "Removed pack $Id from manifest." -ForegroundColor Green
 }
 

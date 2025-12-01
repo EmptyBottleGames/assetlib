@@ -1,15 +1,21 @@
 [
   {
     "id": "MCO_Mocap_Basics",
-    "name": null,
+    "name": "MCO Mocap Basics",
     "source": "Fab",
-    "categories": [],
-    "tags": [],
-    "notes": "",
+    "categories": [
+      "animations",
+      "vfx"
+    ],
+    "tags": [
+      "mocap",
+      "animation"
+    ],
+    "notes": "Enhance your Unreal Engine projects with MoCap Online's free UE5 animation pack. This curated collection offers professional-grade motion capture animations, perfect for game developers and animators seeking to prototype, test, or elevate their creations. Crafted by industry expert Crispin, with over 20 years of AAA-quality motion capture experience, these animations ensure realism and seamless integration into your Unreal projects.",
     "licenseId": "Fab_Standard_License",
     "packType": "content",
     "pluginFolderName": null,
-    "engineVersion": "",
-    "megaSubPath": ""
+    "engineVersion": "5.0 - 5.6",
+    "megaSubPath": "MCO_Mocap_Basics"
   }
 ]

@@ -322,8 +322,12 @@ if (`$env:LOCALAPPDATA -and (Test-Path (Join-Path `$env:LOCALAPPDATA 'MEGAcmd'))
     $final = $prefix + $assetlibFunction + "`r`n" + $megaPathSnippet + "`r`n"
     Set-Content -Path $PROFILE -Value $final -Encoding UTF8
     # Reload the profile in the current session to apply changes immediately
-    Write-Host "Restarting PowerShell to apply profile changes..." -ForegroundColor Cyan
-    Add-ToCurrentSessionPath
+    try {
+        Add-ToCurrentSessionPath
+    } catch {
+        Write-Host "Failed to add to PATH in current session: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
     Write-Host "Updated PowerShell profile successfully." -ForegroundColor Green
 }
 
@@ -371,17 +375,11 @@ function Invoke-MegaCmdLoginWizard {
     }
 
     Write-Host ""
-    Write-Host "MEGAcmd login setup" -ForegroundColor Cyan
+    Write-Host "MEGAcmd Login Wizard" -ForegroundColor Cyan
     Write-Host "------------------------------------------------------"
     Write-Host "assetlib uses MEGAcmd to download packs from MEGA."
     Write-Host "You only need to log into MEGAcmd once per machine."
     Write-Host ""
-    $answer = Read-Host "Would you like to log into MEGAcmd now? (Y/N) [Y]"
-    if ($answer -and $answer -notmatch '^[Yy]') {
-        Write-Host "Skipping MEGAcmd login. You can log in later by running: mega-login" -ForegroundColor Yellow
-        return
-    }
-
     $maxAttempts = 5
     $attempt     = 0
     $email       = $null
@@ -396,23 +394,24 @@ function Invoke-MegaCmdLoginWizard {
                 return
             }
         }
+        $plainPwd = Read-Host "MEGA account password"
+        # If we want to go back to secure string handling, uncomment this block and comment out the plain text version above.
+        # $securePwd = Read-Host "MEGA account password (input will not echo)" -AsSecureString
+        # if (-not $securePwd) {
+        #     Write-Host "No password entered; skipping MEGAcmd login." -ForegroundColor Yellow
+        #     return
+        # }
+        # 
+        ## Convert SecureString to plain text briefly to call mega-login
+        # $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd)
+        # try {
+        #     $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringUni($bstr)
+        # }
+        # finally {
+        #     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        # }
 
-        $securePwd = Read-Host "MEGA account password (input will not echo)" -AsSecureString
-        if (-not $securePwd) {
-            Write-Host "No password entered; skipping MEGAcmd login." -ForegroundColor Yellow
-            return
-        }
-
-        # Convert SecureString to plain text briefly to call mega-login
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd)
-        try {
-            $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringUni($bstr)
-        }
-        finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-
-        Write-Host "Running 'mega-login $email ****' via MEGAcmd..." -ForegroundColor Cyan
+        Write-Host "Running 'mega-login $email $plainPwd' via MEGAcmd..." -ForegroundColor Cyan
 
         try {
             $output  = mega-login $email $plainPwd 2>&1
@@ -442,14 +441,14 @@ function Invoke-MegaCmdLoginWizard {
             Start-Process "https://mega.nz/login"
 
             # Keep the credentials as the last thing on screen while they log in.
-            [void](Read-Host "After you've finished logging into MEGA in the browser, press Enter to continue...")
+            [void](Read-Host "After you've finished logging into MEGA in the browser, press Enter to continue")
 
             # Best-effort wipe of password string after we're done.
             $plainPwd = $null
             return
         }
 
-        # Login failed – clear the plain text password as soon as possible.
+        # Login failed - clear the plain text password as soon as possible.
         $plainPwd = $null
 
         Write-Warning @"
@@ -487,6 +486,20 @@ $output
 }
 
 
+function Invoke-MegaCmdExportInit {
+    # Run mega-export for the first time to accept EULA
+    Write-Host "Running 'mega-export' once to accept MEGA EULA..." -ForegroundColor Cyan
+    
+    mega-export -a ExportInit.txt
+    if ($?) {
+        Write-Host "MEGA EULA accepted successfully." -ForegroundColor Green
+        mega-export -d ExportInit.txt | Out-Null
+    }
+    else {
+        Write-Host "Failed to run 'mega-export' to accept EULA. Run 'mega-export -a ExportInit.txt' then 'mega-export -d ExportInit.txt' to avoid issues later." -ForegroundColor Red
+    }
+}
+
 
 # -----------------------------------------------------------------------------
 # One-time assetlib config (asset store root + license mode) - MEGA-focused
@@ -497,7 +510,6 @@ if (-not (Test-Path $configPath)) {
 
     $defaultRoot = "/AssetLib"
     Write-Host "Enter the MEGA remote folder root for asset store"
-    Write-Host "Example (MEGA):  /AssetLib"
     $megaRootPath = Read-Host "Asset store root URL [$defaultRoot]"
 
     if (-not $megaRootPath) {
@@ -526,6 +538,7 @@ else {
 Install-MegaCmdIfMissing
 Update-ProfileForAssetLibAndMega
 Invoke-MegaCmdLoginWizard
+Invoke-MegaCmdExportInit
 
 Write-Host ""
 Write-Host "assetlib installation/update complete." -ForegroundColor Cyan
