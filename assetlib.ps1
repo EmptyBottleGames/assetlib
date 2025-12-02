@@ -24,6 +24,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($PSVersionTable.PSEdition -eq "Core") {
+    # PowerShell 7+ requires explicit STA
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
+        pwsh.exe -STA -File $PSCommandPath
+        exit
+    }
+} else {
+    # Windows PowerShell 5
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
+        powershell.exe -STA -File $PSCommandPath
+        exit
+    }
+}
+
+
 # Paths for core data files, resolved relative to this script's folder.
 $manifestPath = Join-Path $PSScriptRoot "packs.json"
 $licenseManifestPath = Join-Path $PSScriptRoot "licenses\licenses.json"
@@ -90,16 +105,16 @@ function Set-AssetLibConfig {
 
 function Select-PathZipOrFolder {
     Add-Type -AssemblyName System.Windows.Forms
-
+    
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
     $dialog.CheckFileExists = $false
     $dialog.ValidateNames = $false
     $dialog.Multiselect = $false
     $dialog.FileName = "Select Folder"
-    $dialog.Filter = "Folders"
-
-    $result = $dialog.ShowDialog()
-    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+    $dialog.Filter = "(Folders | *.*)"
+    
+    
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
         return $null
     }
 
@@ -242,14 +257,15 @@ function Select-LocalPackPathFromProject {
 
 function Get-AssetPackManifest {
     if (-not (Test-Path $manifestPath)) {
-        return , @()
+        return ,@()
     }
     $json = Get-Content $manifestPath -Raw
     if (-not $json.Trim()) {
-        return , @()
+        return ,@()
     }
-    $returnJson = $json | ConvertFrom-Json
-    return $returnJson ? $returnJson : , @()
+    $returnJson = $($json | ConvertFrom-Json)
+    $returnJson = ($returnJson -is [System.Array]) ? $returnJson : @($returnJson)
+    return $returnJson ? ,$returnJson : ,@()
 }
 
 function Set-AssetPackManifest {
@@ -262,18 +278,16 @@ function Set-AssetPackManifest {
         , $Packs |
         ConvertTo-Json -Depth 5 |
         Set-Content -Path $manifestPath -Encoding UTF8
-
-        Write-Host "Updated packs.json" -ForegroundColor Green
     }
     catch {
-        Write-Error "Failed to write packs.json: $($_.Exception.Message)"
+        Write-Host "Failed to write packs.json: $($_.Exception.Message)" -ForegroundColor Red
         throw
     }
 }
 
 function Get-AssetLicenseManifest {
     if (-not (Test-Path $licenseManifestPath)) {
-        Write-Error "License manifest not found at $licenseManifestPath"
+        Write-Host "License manifest not found at $licenseManifestPath" -ForegroundColor red
         return , @()
     }
     $json = Get-Content $licenseManifestPath -Raw
@@ -511,9 +525,43 @@ function Open-MegaFolderInBrowser {
     }
 
     if (-not $exitOk) {
-        Write-Host $output
-        Write-Host "mega-export failed for '$RemoteFolder'." -ForegroundColor Red
-        return
+        # Check if the error is that an export already exists.
+        if ( $output -match 'is already exported' ) {
+            # Remove then re-create the export.
+            try {
+                # Kill the existing export
+                $output = mega-export -d $RemoteFolder 2>&1
+                $exitOk = $?
+            }
+            catch {
+                $output = $_.Exception.Message
+                $exitOk = $false
+            }
+            if (-not $exitOk) {
+                Write-Host "mega-export -d failed for '$RemoteFolder': $output." -ForegroundColor Red
+                return
+            }
+            else {
+                # Re-create the export
+                try {
+                    $output = mega-export -a $RemoteFolder 2>&1
+                    $exitOk = $?
+                }
+                catch {
+                    $output = $_.Exception.Message
+                    $exitOk = $false
+                }
+                if (-not $exitOk) {
+                    Write-Host "mega-export failed for '$RemoteFolder': $output." -ForegroundColor Red
+                    return
+                }
+            }
+        }
+        else {
+            Write-Host "mega-export failed for '$RemoteFolder': $output." -ForegroundColor Red
+            return
+        }
+       
     }
 
     # Try to find a URL in the output (MEGA-style link).
@@ -925,9 +973,9 @@ function Add-AssetPack {
             continue
         }
         $licStatus = Get-AssetPackLicenseStatus -Pack ([pscustomobject]@{ 
-            licenseId = $lic.id
-            license   = $lic.name
-        }) -Licenses $licenses
+                licenseId = $lic.id
+                license   = $lic.name
+            }) -Licenses $licenses
        
     }
     if ($licenseMode -eq 'restrictive') {
@@ -1019,8 +1067,8 @@ function Remove-AssetPack {
     $packs = Get-AssetPackManifest
     $before = $packs.Count
     $packToRemove = $packs | Where-Object { $_.id -eq $Id }
-    $remaining = , $packs | Where-Object { $_.id -ne $Id }
-    
+    $remaining = $packs | Where-Object { $_.id -ne $Id }
+    $remaining = ($remaining -is [System.Array]) ? $remaining : @($remaining)
     if ($remaining.Count -eq $before) {
         Write-Error "No pack found with id: $Id"
         return
