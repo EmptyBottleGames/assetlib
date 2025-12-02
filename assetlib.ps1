@@ -30,7 +30,8 @@ if ($PSVersionTable.PSEdition -eq "Core") {
         pwsh.exe -STA -File $PSCommandPath
         exit
     }
-} else {
+}
+else {
     # Windows PowerShell 5
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
         powershell.exe -STA -File $PSCommandPath
@@ -104,25 +105,31 @@ function Set-AssetLibConfig {
 # region: Misc helpers ---------------------------------------------------------
 
 function Select-PathZipOrFolder {
-    Add-Type -AssemblyName System.Windows.Forms
-    
-    $dialog = New-Object System.Windows.Forms.OpenFileDialog
-    $dialog.CheckFileExists = $false
-    $dialog.ValidateNames = $false
-    $dialog.Multiselect = $false
-    $dialog.FileName = "Select Folder"
-    $dialog.Filter = "(Folders | *.*)"
-    
-    
-    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+    # Source - https://stackoverflow.com/a
+    # Posted by postanote, modified by community. See post 'Timeline' for change history
+    # Retrieved 2025-12-02, License - CC BY-SA 4.0
+
+    # Load UX/UI resources
+    Add-Type -AssemblyName  System.Drawing,
+    PresentationCore,
+    PresentationFramework,
+    System.Windows.Forms,
+    microsoft.VisualBasic
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::
+    SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+    $FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+    $FolderBrowser.Multiselect = $false
+    $FolderBrowser.ShowNewFolderButton = $true
+    $FolderBrowser.Description = 'Select a folder.'
+
+    if ($FolderBrowser.ShowDialog((New-Object System.Windows.Forms.Form -Property @{TopMost = $true })) -eq [Windows.Forms.DialogResult]::OK) {
+        return $FolderBrowser.SelectedPath
+    }
+    else {
         return $null
     }
-
-    if ($dialog.FileName -eq "Select Folder") {
-        return Split-Path $dialog.FileName
-    }
-
-    return $dialog.FileName
 }
 
 function Show-DataTable {
@@ -257,15 +264,15 @@ function Select-LocalPackPathFromProject {
 
 function Get-AssetPackManifest {
     if (-not (Test-Path $manifestPath)) {
-        return ,@()
+        return , @()
     }
     $json = Get-Content $manifestPath -Raw
     if (-not $json.Trim()) {
-        return ,@()
+        return , @()
     }
     $returnJson = $($json | ConvertFrom-Json)
     $returnJson = ($returnJson -is [System.Array]) ? $returnJson : @($returnJson)
-    return $returnJson ? ,$returnJson : ,@()
+    return $returnJson ? , $returnJson : , @()
 }
 
 function Set-AssetPackManifest {
