@@ -1,7 +1,5 @@
 param(
     # First positional argument: which subcommand the user wants to run.
-    # We restrict this to a known list using ValidateSet so typos error early.
-    # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_parameters
     [Parameter(Mandatory = $true, Position = 0)]
     [ValidateSet("help", "list", "show", "open", "add", "remove", "licenses", "audit", "install", "uninstall", "mode")]
     [string]$Command,
@@ -24,13 +22,24 @@ param(
     [switch]$Force
 )
 
-# Stop execution on any non-terminating error so we can catch problems early.
-# Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_preference_variables#the-erroractionpreference-variable
 $ErrorActionPreference = "Stop"
 
-# Paths for our core data files, resolved relative to this script's folder.
-# $PSScriptRoot is the directory containing this script.
-# Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_automatic_variables
+if ($PSVersionTable.PSEdition -eq "Core") {
+    # PowerShell 7+ requires explicit STA
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
+        pwsh.exe -STA -File $PSCommandPath
+        exit
+    }
+} else {
+    # Windows PowerShell 5
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
+        powershell.exe -STA -File $PSCommandPath
+        exit
+    }
+}
+
+
+# Paths for core data files, resolved relative to this script's folder.
 $manifestPath = Join-Path $PSScriptRoot "packs.json"
 $licenseManifestPath = Join-Path $PSScriptRoot "licenses\licenses.json"
 $configPath = Join-Path $PSScriptRoot "assetlib.config.json"
@@ -38,20 +47,23 @@ $configPath = Join-Path $PSScriptRoot "assetlib.config.json"
 # region: Config handling ------------------------------------------------------
 
 # Load configuration from assetlib.config.json.
-# Currently supports:
-#   - assetRootUrl : root of your shared asset store (e.g., Google Drive folder)
+#   - megaRootPath : root MEGA folder where all packs live (default: "/AssetLib")
 #   - licenseMode  : "restrictive" or "permissive"
 function Get-AssetLibConfig {
     if (Test-Path $configPath) {
         try {
-            $json = Get-Content $configPath -Raw  # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.management/get-content
+            $json = Get-Content $configPath -Raw
             if ($json.Trim()) {
-                $config = $json | ConvertFrom-Json # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/convertfrom-json
+                $config = $json | ConvertFrom-Json
 
-                # Ensure licenseMode property exists; default to "restrictive" to be safe.
                 if (-not $config.PSObject.Properties.Name -contains 'licenseMode' -or -not $config.licenseMode) {
                     $config | Add-Member -NotePropertyName 'licenseMode' -NotePropertyValue 'restrictive'
                 }
+
+                if (-not $config.PSObject.Properties.Name -contains 'megaRootPath' -or -not $config.megaRootPath) {
+                    $config.megaRootPath = "/AssetLib"
+                }
+
                 return $config
             }
         }
@@ -62,7 +74,7 @@ function Get-AssetLibConfig {
 
     # Default config if file missing or unreadable
     return [pscustomobject]@{
-        assetRootUrl = "https://drive.google.com/drive/my-drive"
+        megaRootPath = "/AssetLib"
         licenseMode  = "restrictive"
     }
 }
@@ -75,10 +87,10 @@ function Set-AssetLibConfig {
     )
 
     try {
-        $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $configPath -Encoding UTF8
-        # Docs:
-        #   ConvertTo-Json: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/convertto-json
-        #   Set-Content   : https://learn.microsoft.com/powershell/module/microsoft.powershell.management/set-content
+        $Config |
+        ConvertTo-Json -Depth 5 |
+        Set-Content -Path $configPath -Encoding UTF8
+
         Write-Host "Updated assetlib.config.json"
     }
     catch {
@@ -89,183 +101,38 @@ function Set-AssetLibConfig {
 
 # endregion --------------------------------------------------------------------
 
-# region: Manifest helpers -----------------------------------------------------
-
-# Load all packs from packs.json (if present).
-function Get-AssetPackManifest {
-    if (-not (Test-Path $manifestPath)) {
-        return @()
-    }
-    $json = Get-Content $manifestPath -Raw
-    if (-not $json.Trim()) {
-        return @()
-    }
-    return $json | ConvertFrom-Json
-}
-
-# Save pack list back to packs.json.
-function Set-AssetPackManifest {
-    param(
-        [Parameter(Mandatory = $true)]
-        $Packs
-    )
-
-    try {
-        $Packs | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
-        Write-Host "Updated packs.json"
-    }
-    catch {
-        Write-Error "Failed to write packs.json: $($_.Exception.Message)"
-        throw
-    }
-}
-
-# Load license definitions from licenses/licenses.json.
-function Get-AssetLicenseManifest {
-    if (-not (Test-Path $licenseManifestPath)) {
-        Write-Error "License manifest not found at $licenseManifestPath"
-        return @()
-    }
-    $json = Get-Content $licenseManifestPath -Raw
-    if (-not $json.Trim()) {
-        return @()
-    }
-    return $json | ConvertFrom-Json
-}
-
-# Given a pack + license manifest, classify its license status.
-# Returns a PSCustomObject with Status and License (metadata or $null).
-function Get-AssetPackLicenseStatus {
-    param(
-        [Parameter(Mandatory = $true)] $Pack,
-        [Parameter(Mandatory = $true)] $Licenses
-    )
-
-    $licenseId = $Pack.licenseId
-
-    if (-not $licenseId) {
-        return [pscustomobject]@{
-            Status    = 'NO-LICENSE'
-            License   = $null
-            LicenseId = $null
-        }
-    }
-
-    $lic = $Licenses | Where-Object { $_.id -eq $licenseId }
-    if (-not $lic) {
-        return [pscustomobject]@{
-            Status    = 'UNKNOWN-LICENSE'
-            License   = $null
-            LicenseId = $licenseId
-        }
-    }
-
-    if (-not $lic.commercialAllowed) {
-        return [pscustomobject]@{
-            Status    = 'NON-COMMERCIAL'
-            License   = $lic
-            LicenseId = $licenseId
-        }
-    }
-
-    return [pscustomobject]@{
-        Status    = 'OK'
-        License   = $lic
-        LicenseId = $licenseId
-    }
-}
-
-# endregion --------------------------------------------------------------------
-
 # region: Misc helpers ---------------------------------------------------------
 
-# Convert common Google Drive URLs into a direct-download link suitable for
-# Invoke-WebRequest. This lets you paste the normal "Get link" URL from Drive.
-#
-# Supported patterns:
-#   - https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
-#   - https://drive.google.com/open?id=<FILE_ID>
-#   - Anything already starting with https://drive.google.com/uc?...
-#
-# For unsupported or non-Drive URLs, the original value is returned.
-# This keeps the function safe for other hosts (e.g. S3, itch.io, etc.).
-#
-# Docs for [regex] in PowerShell:
-#   https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_regular_expressions
-function Convert-ToGoogleDriveDirectDownloadUrl {
-    param(
-        [string]$Url
-    )
-
-    if (-not $Url) {
+function Select-PathZipOrFolder {
+    Add-Type -AssemblyName System.Windows.Forms
+    
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.CheckFileExists = $false
+    $dialog.ValidateNames = $false
+    $dialog.Multiselect = $false
+    $dialog.FileName = "Select Folder"
+    $dialog.Filter = "(Folders | *.*)"
+    
+    
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
         return $null
     }
 
-    # Already a direct-download link? Keep as-is.
-    if ($Url -match '^https://drive\.google\.com/uc\?') {
-        return $Url
+    if ($dialog.FileName -eq "Select Folder") {
+        return Split-Path $dialog.FileName
     }
 
-    # Warn if it looks like a FOLDER url - those won't work as archive_url.
-    if ($Url -match '^https://drive\.google\.com/drive/folders/') {
-        Write-Warning "The provided URL looks like a Google Drive FOLDER link. archive_url should point to a ZIP FILE, not a folder."
-        # We still return the original so the caller can decide what to do.
-        return $Url
-    }
+    return $dialog.FileName
+}
 
-    # Pattern 1: https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
-    $fileMatch = [regex]::Match($Url, 'https://drive\.google\.com/file/d/([^/]+)')
-    if ($fileMatch.Success) {
-        $fileId = $fileMatch.Groups[1].Value
-        if ($fileId) {
-            return "https://drive.google.com/uc?export=download&id=$fileId"
-        }
-    }
-
-    # Pattern 2: ...id=<FILE_ID> in the query string (open?id=... or similar)
-    $idIndex = $Url.IndexOf('id=')
-    if ($idIndex -ge 0) {
-        $idPart = $Url.Substring($idIndex + 3)
-        $ampIndex = $idPart.IndexOf('&')
-        if ($ampIndex -ge 0) {
-            $idPart = $idPart.Substring(0, $ampIndex)
-        }
-        if ($idPart) {
-            return "https://drive.google.com/uc?export=download&id=$idPart"
-        }
-    }
-
-    # Fallback: not a recognized Drive file URL - just return original.
-    return $Url
+function Show-DataTable {
+    param([System.Data.DataTable]$Table)
+    $text = $Table | Format-Table -AutoSize | Out-String
+    Write-Host $text
 }
 
 
-# endregion --------------------------------------------------------------------
-
-# region: Unreal project helpers ----------------------------------------------
-
-# Detect if Unreal Editor is running.
-# Checks for common process names: UnrealEditor, UnrealEditor-Cmd, UE4Editor, UE5Editor
-function Test-UnrealEditorRunning {
-    try {
-        $procs = Get-Process -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -match '^UnrealEditor' -or
-            $_.Name -match '^UE[45]Editor'
-        }
-
-        return ($procs.Count -gt 0)
-    }
-    catch {
-        # If we cannot detect, fail safe and assume it's running
-        return $true
-    }
-}
-
-# Detect the current Unreal project root.
-# We define it as a directory that:
-#  - Contains at least one *.uproject file
-#  - Contains a Content/ folder
+# Returns the current Unreal project root if we're in one (or $null if not).
 function Get-UnrealProjectRoot {
     param(
         [string]$Path = (Get-Location).Path
@@ -288,9 +155,466 @@ function Get-UnrealProjectRoot {
     return $Path
 }
 
-# Given a pack and an Unreal project root, compute the expected install path.
-# For content packs:  Content/AssetLib/<pack.id>/
-# For plugin packs:   Plugins/<pluginFolderName or pack.id>/
+# Discover candidate local pack folders in a UE project:
+# - Top-level subfolders under Content/, excluding Content/AssetLib
+# - Top-level subfolders under Plugins/ (plugin roots)
+function Get-LocalPackCandidatesFromProject {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectRoot
+    )
+
+    $candidates = New-Object System.Collections.Generic.List[object]
+
+    $contentRoot = Join-Path $ProjectRoot 'Content'
+    if (Test-Path $contentRoot) {
+        $contentDirs = Get-ChildItem -Path $contentRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'AssetLib' }
+
+        foreach ($dir in $contentDirs) {
+            $candidates.Add([pscustomobject]@{
+                    Id       = $dir.Name
+                    Path     = "Content\$($dir.Name)"
+                    FullPath = $dir.FullName
+                    Kind     = 'content'
+                })
+        }
+    }
+
+    $pluginsRoot = Join-Path $ProjectRoot 'Plugins'
+    if (Test-Path $pluginsRoot) {
+        $pluginRoots = Get-ChildItem -Path $pluginsRoot -Directory -ErrorAction SilentlyContinue
+        foreach ($p in $pluginRoots) {
+            $hasUplugin = @(Get-ChildItem -Path $p.FullName -Filter *.uplugin -Recurse -ErrorAction SilentlyContinue).Count -gt 0
+            $kind = if ($hasUplugin) { 'plugin' } else { 'content' }
+
+            $candidates.Add([pscustomobject]@{
+                    Id       = $p.Name
+                    Path     = "Plugins\$($p.Name)"
+                    FullPath = $p.FullName
+                    Kind     = $kind
+                })
+        }
+    }
+
+    return $candidates
+}
+
+# Prompt user to choose a local pack folder from project candidates.
+# Returns [PSCustomObject] @{ Path = <string>; Kind = 'content'|'plugin' } or $null.
+function Select-LocalPackPathFromProject {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectRoot
+    )
+
+    $candidates = Get-LocalPackCandidatesFromProject -ProjectRoot $ProjectRoot
+    if (-not $candidates -or $candidates.Count -eq 0) {
+        Write-Host "No candidate pack folders found under Content/ or Plugins/ (excluding Content/AssetLib)." -ForegroundColor Yellow
+        return $null
+    }
+
+    Write-Host ""
+    Write-Host "Discovered pack candidates in this project:" -ForegroundColor Cyan
+    # Create a table to display candidates with indices
+    $table = New-Object System.Data.DataTable
+    $table.Columns.Add("Index") | Out-Null
+    $table.Columns.Add("Name") | Out-Null
+    $table.Columns.Add("Kind") | Out-Null
+
+    for ($i = 0; $i -lt $candidates.Count; $i++) {
+        $c = $candidates[$i]
+        $table.Rows.Add($i, $c.Id, $c.Kind) | Out-Null
+    }
+    
+    Show-DataTable -Table $table
+
+    $index = Read-Host "Enter the index of the folder you want to use for this pack (or blank to cancel)"
+    if (-not $index -and $index -ne 0) {
+        Write-Host "No selection made; skipping project-based discovery." -ForegroundColor Yellow
+        return $null
+    }
+
+    if (-not [int]::TryParse($index, [ref]$null) -or
+        [int]$index -lt 0 -or
+        [int]$index -ge $candidates.Count) {
+
+        Write-Error "Invalid index '$index'."
+        return $null
+    }
+
+    $chosen = $candidates[[int]$index]
+    return [pscustomobject]@{
+        Id   = $chosen.Id
+        Path = $chosen.FullPath
+        Kind = $chosen.Kind
+    }
+}
+
+# endregion --------------------------------------------------------------------
+
+# region: Manifest helpers -----------------------------------------------------
+
+function Get-AssetPackManifest {
+    if (-not (Test-Path $manifestPath)) {
+        return ,@()
+    }
+    $json = Get-Content $manifestPath -Raw
+    if (-not $json.Trim()) {
+        return ,@()
+    }
+    $returnJson = $($json | ConvertFrom-Json)
+    $returnJson = ($returnJson -is [System.Array]) ? $returnJson : @($returnJson)
+    return $returnJson ? ,$returnJson : ,@()
+}
+
+function Set-AssetPackManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Packs
+    )
+
+    try {
+        , $Packs |
+        ConvertTo-Json -Depth 5 |
+        Set-Content -Path $manifestPath -Encoding UTF8
+    }
+    catch {
+        Write-Host "Failed to write packs.json: $($_.Exception.Message)" -ForegroundColor Red
+        throw
+    }
+}
+
+function Get-AssetLicenseManifest {
+    if (-not (Test-Path $licenseManifestPath)) {
+        Write-Host "License manifest not found at $licenseManifestPath" -ForegroundColor red
+        return , @()
+    }
+    $json = Get-Content $licenseManifestPath -Raw
+    if (-not $json.Trim()) {
+        return , @()
+    }
+    $returnJson = $json | ConvertFrom-Json
+    return $returnJson ? $returnJson : , @()
+}
+
+function Get-AssetPackLicenseStatus {
+    param(
+        [Parameter(Mandatory = $true)] $Pack,
+        [Parameter(Mandatory = $true)] $Licenses
+    )
+
+    $licenseId = $Pack.licenseId
+
+    if (-not $licenseId) {
+        return [pscustomobject]@{
+            Status    = 'NO-LICENSE'
+            License   = $null
+            LicenseId = $null
+        }
+    }
+
+    $lic = $Licenses | Where-Object { $_.id -eq $licenseId }
+    if (-not $lic) {
+        return [pscustomobject]@{
+            Status    = 'UNKNOWN-LICENSE'
+            License   = $licenseId -replace '_', ' '
+            LicenseId = $licenseId
+        }
+    }
+
+    if (-not $lic.commercialAllowed) {
+        return [pscustomobject]@{
+            Status    = 'NON-COMMERCIAL'
+            License   = $lic.name
+            LicenseId = $licenseId
+        }
+    }
+
+    return [pscustomobject]@{
+        Status    = 'OK'
+        License   = $lic.name
+        LicenseId = $licenseId
+    }
+}
+
+# endregion --------------------------------------------------------------------
+
+# region: MEGAcmd helpers ------------------------------------------------------
+
+function Test-MegaCmdCliAvailable {
+    try {
+        $null = mega-help 2>$null
+        return $?
+    }
+    catch {
+        return $false
+    }
+}
+
+# Build the full MEGA path for a pack using config.megaRootPath and pack.megaSubPath or pack.id
+function Get-MegaPathForPack {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Pack,
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    $root = if ($Config.megaRootPath) { $Config.megaRootPath } else { "/AssetLib" }
+    $root = $root.TrimEnd('/')
+
+    $sub = $null
+    if ($Pack.PSObject.Properties.Name -contains 'megaSubPath' -and $Pack.megaSubPath) {
+        $sub = $Pack.megaSubPath
+    }
+    else {
+        $sub = $Pack.id
+    }
+
+    $sub = $sub.Trim('/')
+    if (-not $sub) { $sub = $Pack.id }
+
+    return "$root/$sub"
+}
+
+# Use MEGAcmd to upload a local folder into a remote MEGA folder.
+function Invoke-MegaPutFolder {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LocalFolder,
+        [Parameter(Mandatory = $true)]
+        [string]$RemoteFolder,
+        [switch]$Force
+    )
+
+    if (-not (Test-MegaCmdCliAvailable)) {
+        throw "MEGAcmd CLI does not appear to be available. Ensure MEGAcmd is installed, on PATH, and that you are logged in (mega-login)."
+    }
+
+    if (-not (Test-Path $LocalFolder -PathType Container)) {
+        throw "Local path '$LocalFolder' is not a folder. assetlib now expects pack content as a folder (not a .zip)."
+    }
+
+    Write-Host "Preparing to upload pack folder to MEGA:" -ForegroundColor Cyan
+    Write-Host "  Local : $LocalFolder"
+    Write-Host "  Remote: $RemoteFolder"
+    Write-Host ""
+
+    # Check if remote already exists.
+    $remoteExists = $false
+    try {
+        $null = mega-ls $RemoteFolder 2>$null
+        $remoteExists = $?
+    }
+    catch {
+        $remoteExists = $false
+    }
+
+    if ($remoteExists) {
+        if (-not $Force) {
+            $answer = Read-Host "Remote path '$RemoteFolder' already exists. Overwrite it? (Y/N) [N]"
+            if ($answer -notmatch '^[Yy]') {
+                throw "Upload cancelled by user; remote path already exists."
+            }
+        }
+
+        Write-Host "Removing existing remote folder '$RemoteFolder' via mega-rm..." -ForegroundColor Yellow
+        try {
+            $outputRm = mega-rm $RemoteFolder 2>&1
+            if (-not $?) {
+                Write-Host $outputRm
+                throw "mega-rm failed when attempting to remove '$RemoteFolder'."
+            }
+        }
+        catch {
+            throw "Failed to remove remote path '$RemoteFolder': $($_.Exception.Message)"
+        }
+    }
+
+    Write-Host "Uploading via mega-put..." -ForegroundColor Cyan
+    try {
+        $outputPut = mega-put $LocalFolder $RemoteFolder 2>&1
+        if (-not $?) {
+            Write-Host $outputPut
+            throw "mega-put failed for '$LocalFolder' -> '$RemoteFolder'."
+        }
+    }
+    catch {
+        throw "MEGA upload failed: $($_.Exception.Message)"
+    }
+
+    Write-Host "Upload completed to '$RemoteFolder'." -ForegroundColor Green
+}
+
+# Use MEGAcmd to download the MEGA path for a pack into a local temporary directory.
+# Returns the local folder path containing the pack content.
+function Invoke-MegaGetPackFolder {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RemoteFolder,
+        [Parameter(Mandatory = $true)]
+        [string]$DestRoot
+    )
+
+    if (-not (Test-MegaCmdCliAvailable)) {
+        throw "MEGAcmd CLI does not appear to be available. Ensure MEGAcmd is installed, on PATH, and that you are logged in (mega-login)."
+    }
+
+    if (-not (Test-Path $DestRoot)) {
+        New-Item -ItemType Directory -Path $DestRoot -Force | Out-Null
+    }
+
+    Write-Host "Using MEGAcmd to download pack folder:" -ForegroundColor Cyan
+    Write-Host "  Remote: $RemoteFolder"
+    Write-Host "  Local : $DestRoot"
+    Write-Host ""
+
+    try {
+        $output = mega-get $RemoteFolder $DestRoot 2>&1
+        $exitOk = $?
+    }
+    catch {
+        $output = $_.Exception.Message
+        $exitOk = $false
+    }
+
+    if (-not $exitOk) {
+        Write-Host $output
+        throw "mega-get failed. Verify the MEGA path '$RemoteFolder' and that you are logged into MEGAcmd."
+    }
+
+    # mega-get will typically create a subfolder under DestRoot.
+    $items = Get-ChildItem -Path $DestRoot -Directory -ErrorAction SilentlyContinue
+    if (-not $items -or $items.Count -eq 0) {
+        throw "mega-get reported success but no folders were downloaded to '$DestRoot'. Check the remote path."
+    }
+
+    if ($items.Count -eq 1) {
+        return $items[0].FullName
+    }
+
+    # If multiple folders came down, this is unexpected – but we still choose the first.
+    Write-Warning "Multiple folders downloaded under '$DestRoot'; using the first: '$($items[0].FullName)'."
+    return $items[0].FullName
+}
+
+# Generate a MEGA export link for a given remote folder and open it in the browser.
+# The link is NOT stored in packs.json; it is ephemeral from assetlib's perspective.
+function Open-MegaFolderInBrowser {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RemoteFolder
+    )
+
+    if (-not (Test-MegaCmdCliAvailable)) {
+        Write-Host "MEGAcmd CLI does not appear to be available. Cannot generate export link." -ForegroundColor Red
+        return
+    }
+
+    Write-Host "Requesting MEGA export link for '$RemoteFolder'..." -ForegroundColor Cyan
+
+    $output = ""
+    try {
+        $output = mega-export -a $RemoteFolder 2>&1
+        $exitOk = $?
+    }
+    catch {
+        $output = $_.Exception.Message
+        $exitOk = $false
+    }
+
+    if (-not $exitOk) {
+        # Check if the error is that an export already exists.
+        if ( $output -match 'is already exported' ) {
+            # Remove then re-create the export.
+            try {
+                # Kill the existing export
+                $output = mega-export -d $RemoteFolder 2>&1
+                $exitOk = $?
+            }
+            catch {
+                $output = $_.Exception.Message
+                $exitOk = $false
+            }
+            if (-not $exitOk) {
+                Write-Host "mega-export -d failed for '$RemoteFolder': $output." -ForegroundColor Red
+                return
+            }
+            else {
+                # Re-create the export
+                try {
+                    $output = mega-export -a $RemoteFolder 2>&1
+                    $exitOk = $?
+                }
+                catch {
+                    $output = $_.Exception.Message
+                    $exitOk = $false
+                }
+                if (-not $exitOk) {
+                    Write-Host "mega-export failed for '$RemoteFolder': $output." -ForegroundColor Red
+                    return
+                }
+            }
+        }
+        else {
+            Write-Host "mega-export failed for '$RemoteFolder': $output." -ForegroundColor Red
+            return
+        }
+       
+    }
+
+    # Try to find a URL in the output (MEGA-style link).
+    $link = $null
+    $_matches = [regex]::Matches($output, 'https://mega\.nz/\S+')
+    if ($_matches.Count -gt 0) {
+        $link = $_matches[0].Value
+    }
+
+    if (-not $link) {
+        Write-Host $output
+        Write-Host "mega-export did not produce a recognizable MEGA URL." -ForegroundColor Red
+        return
+    }
+
+    Write-Host "Opening MEGA link in your default browser:" -ForegroundColor Green
+    Write-Host "  $link"
+    Start-Process $link
+    [void](Read-Host "Press Enter to continue after you've finished with the MEGA link")
+    try {
+        $outDel = mega-export -d $RemoteFolder 2>&1
+        if (-not $?) {
+            Write-Host $outDel -ForegroundColor Red
+            Write-Warning "mega-export -d did not succeed; export link may still be active."
+        }
+        else {
+            Write-Host "Export link revoked." -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "Failed to revoke export link: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# endregion --------------------------------------------------------------------
+
+# region: Unreal project helpers (remaining) ----------------------------------
+
+function Test-UnrealEditorRunning {
+    try {
+        $procs = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match '^UnrealEditor' -or
+            $_.Name -match '^UE[45]Editor'
+        }
+
+        return ($procs.Count -gt 0)
+    }
+    catch {
+        return $true
+    }
+}
+
 function Get-AssetPackInstallPath {
     param(
         [Parameter(Mandatory = $true)][object]$Pack,
@@ -316,7 +640,6 @@ function Get-AssetPackInstallPath {
         return Join-Path $pluginsRoot $pluginFolderName
     }
     else {
-        # Default to content pack under Content/AssetLib/<id>/
         $assetLibRoot = Join-Path (Join-Path $ProjectRoot 'Content') 'AssetLib'
         return Join-Path $assetLibRoot $Pack.id
     }
@@ -326,7 +649,6 @@ function Get-AssetPackInstallPath {
 
 # region: Listing & basic operations ------------------------------------------
 
-# List all packs, optionally filtered by Category/Tag
 function Get-AssetPackList {
     param(
         [string]$Category,
@@ -339,13 +661,10 @@ function Get-AssetPackList {
         return
     }
 
-    # Filter by category if specified.
-    # categories is expected to be an array in packs.json.
     if ($Category) {
         $packs = $packs | Where-Object { $_.categories -contains $Category }
     }
 
-    # Filter by tag if specified.
     if ($Tag) {
         $packs = $packs | Where-Object { $_.tags -contains $Tag }
     }
@@ -362,7 +681,6 @@ function Get-AssetPackList {
     }
 }
 
-# Show the full JSON for a single pack
 function Get-AssetPack {
     param(
         [Parameter(Mandatory = $true)]
@@ -376,13 +694,10 @@ function Get-AssetPack {
         return
     }
 
-    # Dump pack as JSON so you can see everything.
     $pack | ConvertTo-Json -Depth 5
 }
 
-# Open a pack's cloud_url in the default browser.
-# Uses Start-Process, which is the idiomatic way to open URLs.
-# Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.management/start-process
+# Open the pack's MEGA folder in the browser by exporting its MEGA path on demand.
 function Open-AssetPack {
     param(
         [Parameter(Mandatory = $true)]
@@ -395,29 +710,35 @@ function Open-AssetPack {
         Write-Error "No pack found with id: $Id"
         return
     }
-    if (-not $pack.cloud_url) {
-        Write-Error "Pack '$Id' has no cloud_url set."
-        return
-    }
-    Write-Host "Opening $($pack.cloud_url) in your browser..."
-    Start-Process $pack.cloud_url
+
+    $config = Get-AssetLibConfig
+    $remotePath = Get-MegaPathForPack -Pack $pack -Config $config
+
+    Open-MegaFolderInBrowser -RemoteFolder $remotePath
 }
 
-# Print a table of all licenses and whether they are commercial-safe.
 function Get-AssetLicenseList {
     $licenses = Get-AssetLicenseManifest
     if (-not $licenses -or $licenses.Count -eq 0) {
-        Write-Host "No licenses defined. Edit licenses/licenses.json to add licenses." -ForegroundColor Yellow
+        Write-Host "No licenses defined. Edit licenses/licenses.json to add licenses." -ForegroundColor Red
         return
     }
+    # Create a data table to display licenses
+    $table = New-Object System.Data.DataTable
+    $table.Columns.Add("Index") | Out-Null
+    $table.Columns.Add("Id") | Out-Null
+    $table.Columns.Add("Status") | Out-Null
+    $table.Columns.Add("Name") | Out-Null
 
-    foreach ($lic in $licenses) {
+    for ($i = 0; $i -lt $licenses.Count; $i++) {
+        $lic = $licenses[$i]
         $flag = if ($lic.commercialAllowed) { "COMMERCIAL" } else { "NON-COMMERCIAL" }
-        "{0,-30} {1,-15}  - {2}" -f $lic.id, "[$flag]", $lic.name
+        $table.Rows.Add($i, $lic.id, $flag, $lic.name) | Out-Null
     }
+    # Show the licenses table
+    Show-DataTable -Table $table
 }
 
-# Show details for a single license, plus full license text from its .txt file.
 function Get-AssetLicense {
     param(
         [Parameter(Mandatory = $true)]
@@ -456,13 +777,102 @@ function Get-AssetLicense {
 
 # region: Add / Remove pack ----------------------------------------------------
 
-# Interactive add flow for a new pack:
-# - offers to open the asset store root (from config) in browser
-# - collects fields for the pack
-# - automatically converts Google Drive file URLs into direct-download URLs
-#   for archive_url (uc?export=download&id=...)
-# - adds optional engineVersion metadata (e.g. "5.3")
-# - enforces license rules based on licenseMode
+# Interactive wizar
+function Add-AssetPackHelper {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Packs,
+        [string]$Id = $null,
+        [string]$UploadFolderPath = $null
+    )
+    
+    # Define dummy object to store new pack data. We'll fill it in interactively.
+    $interactivePackData = [PSCustomObject]@{
+        id               = $Id
+        name             = $Id -replace '_', ' '
+        uploadFolderPath = $UploadFolderPath
+    }
+
+    if ($Id) {
+        $interactivePackData.id = Read-Host "id (usually the folder name) [${Id}]"
+        if (-not $interactivePackData.id) {
+            $interactivePackData.id = $Id
+        }
+    }
+    else {
+        $interactivePackData.id = Read-Host "id (usually the folder name. e.g. fab_scifi_soldier_pro_pack)"
+    }
+
+    if (-not $interactivePackData.id) {
+        Write-Error "id is required."
+        return
+    }
+    
+    # Check for existing pack with this id.
+    if ($Packs | Where-Object { $_.id -eq $interactivePackData.id }) {
+        Write-Error "A pack with id '$($interactivePackData.id)' already exists."
+        return
+    }
+
+    $nameFromId = $interactivePackData.id -replace '_', ' '
+    $name = Read-Host "name (nice human-readable name) [$nameFromId]"
+    if (-not $name) { $name = $nameFromId }
+    $interactivePackData.name = $name
+
+    if (-not $UploadFolderPath) {
+        $useDialog = Read-Host "Do you want to select the local pack folder via a dialog? (Y/N) [N]"
+        if ($useDialog -match '^[Yy]') {
+            $pickedPath = Select-PathZipOrFolder
+            if (-not $pickedPath) {
+                Write-Error "No folder selected; cancelling."
+                return
+            }
+            $interactivePackData.uploadFolderPath = $pickedPath
+            Write-Host "Selected: $($interactivePackData.uploadFolderPath)"
+            
+        }
+        else {
+            $interactivePackData.uploadFolderPath = Read-Host "Enter the full local path to the folder containing the pack content"
+        }
+    }
+    else {
+        $interactivePackData.uploadFolderPath = Read-Host "Enter the full local path to the pack folder [$($interactivePackData.uploadFolderPath)]"
+        if (-not $interactivePackData.uploadFolderPath) {
+            $interactivePackData.uploadFolderPath = $UploadFolderPath
+        }
+    }
+
+    if (-not $interactivePackData.uploadFolderPath) {
+        Write-Error "No local folder path supplied; cancelling."
+        return
+    }
+
+    if (Test-Path $interactivePackData.uploadFolderPath -PathType Leaf) {
+        $ext = [System.IO.Path]::GetExtension($interactivePackData.uploadFolderPath)
+        if ($ext -ieq ".zip") {
+            Write-Error "assetlib now expects pack content as a folder (not a .zip). Please extract the zip and rerun 'assetlib add'."
+            return
+        }
+        else {
+            Write-Error "Local path '$($interactivePackData.uploadFolderPath)' is a file; a folder path is required."
+            return
+        }
+    }
+
+    if (-not (Test-Path $interactivePackData.uploadFolderPath -PathType Container)) {
+        Write-Error "Local folder '$($interactivePackData.uploadFolderPath)' does not exist."
+        return
+    }
+
+    return $interactivePackData
+}
+
+# Interactive add flow for a new pack, MEGA-native and folder-based:
+# - If in a UE project root, offers to auto-select a local pack folder from Content/ or Plugins/
+#   (ignores Content/AssetLib).
+# - Otherwise, lets the user pick a folder via dialog or manual input.
+# - Uploads the folder to $config.megaRootPath/<megaSubPath-or-id> via mega-put.
+# - Stores only metadata + megaSubPath, no URLs or archive paths.
 function Add-AssetPack {
     $packs = Get-AssetPackManifest
     $config = Get-AssetLibConfig
@@ -473,56 +883,37 @@ function Add-AssetPack {
         return
     }
 
-    $id = Read-Host "id (e.g. fab_scifi_soldier_pro_pack)"
-    if (-not $id) {
-        Write-Error "id is required."
-        return
+    $projectRoot = Get-UnrealProjectRoot
+    $defaultPackType = 'content'
+    $interactivePackData = [PSCustomObject]@{
+        id               = $null
+        name             = $null
+        uploadFolderPath = $null
+        defaultPackType  = $defaultPackType
     }
-    if ($packs | Where-Object { $_.id -eq $id }) {
-        Write-Error "A pack with id '$id' already exists."
-        return
+    
+    if ($projectRoot) {
+        Write-Host ""
+        Write-Host "Detected Unreal project root at: $projectRoot" -ForegroundColor Cyan
+        $autoUse = Read-Host "Select a pack folder from this project's Content/ or Plugins/? (Y/N) [Y]"
+        if (-not $autoUse -or $autoUse -match '^[Yy]') {
+            $selection = Select-LocalPackPathFromProject -ProjectRoot $projectRoot
+            if ($selection) {
+                Write-Host "Using local folder: $($selection.Path) ($($selection.Kind))" -ForegroundColor Green
+                $interactivePackData.uploadFolderPath = $selection.Path
+                $interactivePackData.defaultPackType = $selection.Kind
+            }
+
+        }
+        $interactivePackData = Add-AssetPackHelper -Packs $packs -Id $selection.Id -UploadFolderPath $selection.Path
+    }
+    else {
+        # This is where we do default wizard for non-project folder selection.
+        $interactivePackData = Add-AssetPackHelper -Packs $packs
     }
 
-    $name = Read-Host "name (nice human-readable name)"
     $source = Read-Host "source (Fab/Quixel/Self/etc) [Fab]"
     if (-not $source) { $source = "Fab" }
-
-    # QoL: open your asset root (e.g., Google Drive 'GameLibrary/Packs') first,
-    # so you can create/find the folder and copy its URL.
-    $openDrive = Read-Host "Open asset store root in your browser now to create/find the folder URL? (Y/N) [N]"
-    if ($openDrive -match '^[Yy]') {
-        $driveUrl = $config.assetRootUrl
-        if (-not $driveUrl) {
-            $driveUrl = "https://drive.google.com/drive/my-drive"
-        }
-        Write-Host "Opening $driveUrl..."
-        Start-Process $driveUrl
-        Write-Host "After creating/finding the folder, copy its URL and paste it below."
-    }
-
-    $cloudUrl = Read-Host "Google Drive folder URL (cloud_url)"
-
-    # archive_url handling:
-    # We allow the user to paste either:
-    #   - a full Drive FILE URL (e.g. 'file/d/<id>/view?usp=sharing'), or
-    #   - a prebuilt direct download URL, or
-    #   - any other host URL (S3, itch.io, etc.).
-    #
-    # If it looks like a Google Drive file URL, we convert it to the direct
-    # download form for you so you don't have to manually extract FILE_ID.
-    $archiveUrlRaw = Read-Host "Direct download archive URL or Drive FILE URL (archive_url, optional)"
-    $archiveUrl = $null
-    if ($archiveUrlRaw) {
-        $archiveUrl = Convert-ToGoogleDriveDirectDownloadUrl -Url $archiveUrlRaw
-        if ($archiveUrl -ne $archiveUrlRaw) {
-            Write-Host "Converted Google Drive URL to direct download form:" -ForegroundColor Cyan
-            Write-Host "  $archiveUrl"
-        }
-        else {
-            Write-Host "archive_url stored as:" -ForegroundColor Cyan
-            Write-Host "  $archiveUrl"
-        }
-    }
 
     $catsRaw = Read-Host "categories (comma-separated: assets, animations, vfx, systems, tools, etc.)"
     $categories = @()
@@ -542,93 +933,130 @@ function Add-AssetPack {
 
     $notes = Read-Host "notes (optional)"
 
-    # Optional engine version metadata:
-    # Example: "5.3", "5.4", etc. Used for soft compatibility warnings on install.
-    $engineVersion = Read-Host "engine version this pack/plugin was built/tested against (optional, e.g. 5.3)"
-
-    Write-Host ""
-    Write-Host "Available licenses:" -ForegroundColor Cyan
-    Get-AssetLicenseList
-    Write-Host ""
-    $licenseId = Read-Host "license id (must match one of the IDs above)"
-
+    $engineVersion = Read-Host "engine version this pack/plugin was built/tested against (optional, e.g. 5.6 or a range like 5.0-5.7)"
+    
+    $finished = $false
     $licStatus = [pscustomobject]@{
         Status    = 'NO-LICENSE'
         License   = $null
         LicenseId = $null
     }
-    if ($licenseId) {
-        $licStatus = Get-AssetPackLicenseStatus -Pack ([pscustomobject]@{ licenseId = $licenseId }) -Licenses $licenses
+    while (-not $finished) {
+        Write-Host ""
+        Write-Host "Available licenses:" -ForegroundColor Cyan
+        Get-AssetLicenseList
+        $licenseMode = $config.licenseMode
+        $licenseIndex = Read-Host $($licenseMode -eq "restrictive" ? "Enter the index of the license to assign to this pack" : "Enter the index of the license to assign to this pack (Leave blank for no license)")
+        # Guard against invalid input
+        if (-not $licenseIndex -and $licenseMode -eq 'restrictive') {
+            Write-Host "In restrictive mode, a license must be assigned." -ForegroundColor Red
+            continue
+        }
+        if (-not $licenseIndex -and $licenseMode -eq 'permissive') {
+            $finished = $true
+        }
+        if ($licenseIndex) {
+            if (-not [int]::TryParse($licenseIndex, [ref]$null) -or
+                [int]$licenseIndex -lt 0 -or
+                [int]$licenseIndex -ge $licenses.Count) {
+
+                Write-Host "Invalid index '$licenseIndex'" -ForegroundColor Red
+                continue
+            }
+            $licenseIndex = [int]$licenseIndex
+        }
+        try {
+            $lic = $licenses[$licenseIndex]
+            $finished = $true
+        }
+        catch {
+            continue
+        }
+        $licStatus = Get-AssetPackLicenseStatus -Pack ([pscustomobject]@{ 
+                licenseId = $lic.id
+                license   = $lic.name
+            }) -Licenses $licenses
+       
     }
-
-    $licenseMode = $config.licenseMode
-
     if ($licenseMode -eq 'restrictive') {
-        # In restrictive mode, we only allow packs with Status 'OK'.
         switch ($licStatus.Status) {
             'NO-LICENSE' {
                 Write-Error "No licenseId provided; cannot add pack in restrictive mode."
                 return
             }
             'UNKNOWN-LICENSE' {
-                Write-Error "License id '$licenseId' not found in licenses/licenses.json (restrictive mode)."
+                Write-Error "License id '$($licStatus.License)' not found in licenses/licenses.json (restrictive mode)."
                 return
             }
             'NON-COMMERCIAL' {
-                Write-Error "License '$licenseId' is marked as NON-COMMERCIAL. This pack cannot be added in restrictive mode."
+                Write-Error "License '$($licStatus.License)' is marked as NON-COMMERCIAL. This pack cannot be added in restrictive mode."
                 return
             }
-            'OK' { }
+            'OK' { Write-Host "Selected license '$($licStatus.License)'" -ForegroundColor Green }
         }
     }
     else {
-        # Permissive mode: allow but warn on non-OK statuses.
         switch ($licStatus.Status) {
             'NO-LICENSE' {
                 Write-Warning "No licenseId provided; pack added in permissive mode but flagged as NO-LICENSE."
             }
             'UNKNOWN-LICENSE' {
-                Write-Warning "License id '$licenseId' not found in licenses/licenses.json; pack added in permissive mode but flagged as UNKNOWN-LICENSE."
+                Write-Warning "License '$($licStatus.License)' not found in licenses/licenses.json; pack added in permissive mode but flagged as UNKNOWN-LICENSE."
             }
             'NON-COMMERCIAL' {
-                Write-Warning "License '$licenseId' is NON-COMMERCIAL; pack added in permissive mode but only safe for non-commercial contexts."
+                Write-Warning "License '$($licStatus.License)' is NON-COMMERCIAL; pack added in permissive mode but only safe for non-commercial contexts."
             }
-            'OK' { }
+            'OK' { Write-Host "Selected license '$($licStatus.License)'" -ForegroundColor Green }
         }
     }
 
-    # Determine packType and pluginFolderName
-    $packType = Read-Host "pack type (content/plugin) [content]"
-    if (-not $packType) { $packType = 'content' }
+    $packTypePromptDefault = $defaultPackType
+    $packType = Read-Host "pack type (content/plugin) [$($interactivePackData.defaultPackType ? $interactivePackData.defaultPackType : $defaultPackType)]"
+    if (-not $packType) { $packType = $packTypePromptDefault }
 
     $pluginFolderName = $null
     if ($packType -eq 'plugin') {
-        $pluginFolderName = Read-Host "plugin folder name under Plugins/ (optional, default = id) [$id]"
-        if (-not $pluginFolderName) { $pluginFolderName = $id }
+        $pluginFolderName = Read-Host "plugin folder name under Plugins/ (optional) [$($interactivePackData.id)]"
+        if (-not $pluginFolderName) { $pluginFolderName = $interactivePackData.id }
+    }
+
+    $megaSubPath = Read-Host "Remote MEGA subpath under root '$($config.megaRootPath)' (optional) [$($interactivePackData.id)]"
+    if ($megaSubPath) {
+        $megaSubPath = $megaSubPath.Trim('/')
+    }
+    if (-not $megaSubPath) {
+        $megaSubPath = $interactivePackData.id
     }
 
     $newPack = [PSCustomObject]@{
-        id               = $id
-        name             = $name
+        id               = $interactivePackData.id
+        name             = $interactivePackData.name
         source           = $source
-        cloud_url        = $cloudUrl
-        archive_url      = $archiveUrl
         categories       = $categories
         tags             = $tags
         notes            = $notes
-        licenseId        = $licenseId
+        licenseId        = $lic.id
         packType         = $packType
         pluginFolderName = $pluginFolderName
         engineVersion    = $engineVersion
+        megaSubPath      = $megaSubPath  # relative under megaRootPath
+    }
+
+    $remotePath = Get-MegaPathForPack -Pack $newPack -Config $config
+
+    try {
+        Invoke-MegaPutFolder -LocalFolder $interactivePackData.uploadFolderPath -RemoteFolder $remotePath -Force:$Force
+    }
+    catch {
+        Write-Error "Failed to upload pack folder to MEGA: $($_.Exception.Message)"
+        return
     }
 
     $packs += $newPack
     Set-AssetPackManifest -Packs $packs
-    Write-Host "Added pack $id with license '$licenseId' in mode '$licenseMode'." -ForegroundColor Green
+    Write-Host "Added pack $($interactivePackData.id) with license '$($lic.id)' in mode '$($config.licenseMode)'. Remote MEGA path: $remotePath" -ForegroundColor Green
 }
 
-
-# Remove a pack by id from the manifest only; does NOT delete Google Drive or project files.
 function Remove-AssetPack {
     param(
         [Parameter(Mandatory = $true)]
@@ -638,41 +1066,63 @@ function Remove-AssetPack {
 
     $packs = Get-AssetPackManifest
     $before = $packs.Count
+    $packToRemove = $packs | Where-Object { $_.id -eq $Id }
     $remaining = $packs | Where-Object { $_.id -ne $Id }
-
+    $remaining = ($remaining -is [System.Array]) ? $remaining : @($remaining)
     if ($remaining.Count -eq $before) {
         Write-Error "No pack found with id: $Id"
         return
     }
 
     if (-not $Force) {
-        $confirm = Read-Host "Remove pack '$Id' from manifest only (does not delete any files)? (Y/N) [N]"
+        $confirm = Read-Host "Remove pack '$Id' from assetlib (removes manifest entry and MEGA folder)? (Y/N) [N]"
         if ($confirm -notmatch '^[Yy]') {
             Write-Host "Removal cancelled."
             return
         }
     }
 
-    Set-AssetPackManifest -Packs $remaining
-    Write-Host "Removed pack $Id from manifest (no project or Drive files were deleted)." -ForegroundColor Yellow
+    $config = Get-AssetLibConfig
+
+    if ($packToRemove) {
+        $remotePath = Get-MegaPathForPack -Pack $packToRemove -Config $config
+        if (Test-MegaCmdCliAvailable) {
+            Write-Host "Removing MEGA folder at '$remotePath' via mega-rm..." -ForegroundColor Cyan
+            try {
+                $output = mega-rm -r -f $remotePath 2>&1
+                $exitOk = $?
+            }
+            catch {
+                $output = $_.Exception.Message
+                $exitOk = $false
+            }
+
+            if (-not $exitOk) {
+                # check output for "No such file or directory" to avoid false warning
+                if ($output -notmatch 'No such file or directory') {
+                    Write-Warning "mega-rm failed to remove MEGA folder for pack '$Id'. Error: $output"
+                }
+                else {
+                    Write-Host "MEGA folder for pack '$Id' does not exist; nothing to remove." -ForegroundColor Cyan
+                }
+            }
+            else {
+                Write-Host "Removed MEGA folder for pack '$Id'." -ForegroundColor Green
+            }
+        }
+        else {
+            Write-Warning "MEGAcmd CLI not available; skipping remote removal for '$Id'."
+        }
+    }
+
+    Set-AssetPackManifest -Packs $($remaining ? $remaining : , @()) 
+    Write-Host "Removed pack $Id from manifest." -ForegroundColor Green
 }
 
 # endregion --------------------------------------------------------------------
 
 # region: Install / Uninstall into Unreal project -----------------------------
 
-# Install a pack into the current Unreal project root.
-# Downloads archive_url and extracts into the appropriate folder based on packType.
-# Features:
-#   - License-mode enforcement (restrictive/permissive)
-#   - Unreal project detection (uproject + Content/)
-#   - Editor safety: blocks while Unreal Editor is running unless -Force
-#   - Engine-version awareness for plugins (+ -Force override)
-#   - C++ plugin vs Blueprint-only project warning
-#   - Engine-style plugin archive detection: BLOCKED COMPLETELY
-#   - ZIP validation (header check)
-#   - Streaming download with progress bar (HttpClient + Write-Progress)
-#   - Flattening of single top-level folder in zip to avoid double nesting
 function Install-AssetPack {
     param(
         [Parameter(Mandatory = $true)]
@@ -686,7 +1136,6 @@ function Install-AssetPack {
         return
     }
 
-    # Editor safety: don't install while Unreal Editor is running unless -Force is used.
     if (Test-UnrealEditorRunning) {
         if (-not $Force) {
             Write-Error "Unreal Editor appears to be running. Close the editor before installing a pack, or run again with -Force to override."
@@ -722,12 +1171,9 @@ function Install-AssetPack {
         }
     }
 
-    if (-not $pack.archive_url) {
-        Write-Error "Pack '$Id' has no archive_url configured. Set archive_url in packs.json or via 'assetlib add' and try again."
-        return
-    }
+    $remotePath = Get-MegaPathForPack -Pack $pack -Config $config
 
-    # Detect project engine version and whether it has C++ modules.
+    # Detect project engine version / C++ modules (unchanged logic).
     $projectEngineVersionString = $null
     $projectEngineMajor = $null
     $projectEngineMinor = $null
@@ -737,7 +1183,6 @@ function Install-AssetPack {
     try {
         $uprojectFiles = Get-ChildItem -Path $projectRoot -Filter *.uproject
         if ($uprojectFiles.Count -ge 1) {
-            # If multiple, just take the first; typical project has one.
             $uprojectPath = $uprojectFiles[0].FullName
             $uprojectJson = Get-Content $uprojectPath -Raw | ConvertFrom-Json
 
@@ -764,7 +1209,6 @@ function Install-AssetPack {
 
     $targetPath = Get-AssetPackInstallPath -Pack $pack -ProjectRoot $projectRoot
 
-    # Safety check: ensure targetPath is under projectRoot
     if (-not $targetPath.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Error "Resolved install path '$targetPath' is not under project root '$projectRoot'. Aborting for safety."
         return
@@ -788,130 +1232,23 @@ function Install-AssetPack {
         }
     }
 
-    $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_" + $Id + "_" + [System.Guid]::NewGuid().ToString() + ".zip")
-    $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) ("assetlib_extract_" + $Id + "_" + [System.Guid]::NewGuid().ToString())
+    $tempBaseDir = [System.IO.Path]::GetTempPath()
+    $tempDownload = Join-Path $tempBaseDir ("assetlib_dl_" + $Id + "_" + [System.Guid]::NewGuid().ToString())
 
-    # --- Streaming download with progress bar using HttpClient ----------------
+    $localPackFolder = $null
     try {
-        Write-Host "Downloading archive for '$Id' from $($pack.archive_url)..."
-
-        # Docs: System.Net.Http.HttpClient
-        # https://learn.microsoft.com/dotnet/api/system.net.http.httpclient
-        $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $true
-        $client = [System.Net.Http.HttpClient]::new($handler)
-        $response = $client.GetAsync($pack.archive_url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
-
-        if (-not $response.IsSuccessStatusCode) {
-            throw "HTTP $([int]$response.StatusCode) - $($response.ReasonPhrase)"
-        }
-
-        $contentLength = $response.Content.Headers.ContentLength
-        $inStream = $response.Content.ReadAsStream()
-        $outStream = [System.IO.File]::Open($tempFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-
-        try {
-            $buffer = New-Object byte[] 8192
-            $totalRead = 0L
-            $read = 0
-
-            do {
-                $read = $inStream.Read($buffer, 0, $buffer.Length)
-                if ($read -gt 0) {
-                    $outStream.Write($buffer, 0, $read)
-                    $totalRead += $read
-
-                    if ($contentLength -and $contentLength -gt 0) {
-                        $percent = [int](($totalRead * 100) / $contentLength)
-                        # Docs: Write-Progress
-                        # https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/write-progress
-                        Write-Progress -Activity "Downloading $Id" -Status "$percent% complete" -PercentComplete $percent
-                    }
-                }
-            } while ($read -gt 0)
-
-            Write-Progress -Activity "Downloading $Id" -Completed
-        }
-        finally {
-            if ($outStream) { $outStream.Dispose() }
-            if ($inStream) { $inStream.Dispose() }
-            if ($client) { $client.Dispose() }
-        }
+        $localPackFolder = Invoke-MegaGetPackFolder -RemoteFolder $remotePath -DestRoot $tempDownload
     }
     catch {
-        Write-Error "Failed to download archive from '$($pack.archive_url)': $($_.Exception.Message)"
-        if (Test-Path $tempFile) {
-            Remove-Item $tempFile -Force
+        Write-Error "Failed to download pack folder for '$Id' using MEGAcmd: $($_.Exception.Message)"
+        if (Test-Path $tempDownload) {
+            Remove-Item $tempDownload -Recurse -Force
         }
         return
     }
 
-    # Before extracting, sanity-check that the file looks like a ZIP.
-    # ZIP files typically start with the bytes 'PK' (0x50 0x4B).
-    # Use System.IO.File APIs so this works on both Windows PowerShell and PowerShell 7+.
     try {
-        $headerBytes = New-Object byte[] 4
-        $fs = [System.IO.File]::OpenRead($tempFile)
-        try {
-            $read = $fs.Read($headerBytes, 0, $headerBytes.Length)
-        }
-        finally {
-            $fs.Dispose()
-        }
-    }
-    catch {
-        Write-Error "Downloaded file could not be read from '$tempFile': $($_.Exception.Message)"
-        return
-    }
-
-    if ($read -lt 2 -or
-        $headerBytes[0] -ne 0x50 -or $headerBytes[1] -ne 0x4B) {
-
-        # Keep a copy of what we downloaded so you can inspect it.
-        $debugCopy = Join-Path $projectRoot ("assetlib_failed_download_" + $Id + ".bin")
-        Copy-Item -LiteralPath $tempFile -Destination $debugCopy -Force
-
-        Write-Error @"
-Downloaded file for pack '$Id' does not look like a ZIP archive.
-This often means Google Drive returned an HTML page (login/confirm) instead of the file.
-
-Saved the raw downloaded file to:
-  $debugCopy
-
-Check this file in a browser or text editor to see what Drive is returning.
-Verify that:
-  - The Drive file itself is actually a .zip
-  - Sharing is set to 'Anyone with the link can view'
-  - The archive_url in packs.json uses a FILE id, not a FOLDER url.
-"@
-        return
-    }
-
-    try {
-        Write-Host "Extracting archive to temporary folder '$tempExtract'..."
-        # Docs: Expand-Archive
-        # https://learn.microsoft.com/powershell/module/microsoft.powershell.archive/expand-archive
-        Expand-Archive -Path $tempFile -DestinationPath $tempExtract -Force
-    }
-    catch {
-        # Keep a copy of the downloaded file for debugging on extraction errors.
-        $debugCopy = Join-Path $projectRoot ("assetlib_failed_extract_" + $Id + ".zip")
-        Copy-Item -LiteralPath $tempFile -Destination $debugCopy -Force
-
-        Write-Error @"
-Failed to extract archive for '$Id' into temporary folder '$tempExtract': $($_.Exception.Message)
-
-A copy of the downloaded file was saved to:
-  $debugCopy
-
-Try opening that file with 7-Zip or Explorer to confirm it is a valid ZIP archive.
-If it is not, double-check the archive_url in packs.json and the Drive sharing settings.
-"@
-        return
-    }
-
-    try {
-        # Plugin-specific metadata checks (engine version, C++ modules, engine-level distribution)
+        # Plugin-specific metadata checks (unchanged logic, now scanning folder).
         $pluginEngineVersionString = $null
         $pluginEngineMajor = $null
         $pluginEngineMinor = $null
@@ -919,14 +1256,14 @@ If it is not, double-check the archive_url in packs.json and the Drive sharing s
         $pluginIsEngineStylePackage = $false
 
         if ($pack.packType -eq 'plugin') {
-            $upluginFiles = Get-ChildItem -Path $tempExtract -Recurse -Filter *.uplugin
+            $upluginFiles = Get-ChildItem -Path $localPackFolder -Recurse -Filter *.uplugin
             if (-not $upluginFiles -or $upluginFiles.Count -eq 0) {
-                Write-Error "Pack '$Id' is marked as plugin but the archive does not contain a .uplugin file. Cannot install as plugin."
+                Write-Error "Pack '$Id' is marked as plugin but the MEGA folder does not contain a .uplugin file. Cannot install as plugin."
                 return
             }
 
             $upluginFile = $upluginFiles[0]
-            $relativeUpluginPath = $upluginFile.FullName.Substring($tempExtract.Length).TrimStart('\', '/')
+            $relativeUpluginPath = $upluginFile.FullName.Substring($localPackFolder.Length).TrimStart('\', '/')
             if ($relativeUpluginPath -like '*Engine/Plugins*' -or $relativeUpluginPath -like '*Engine\Plugins*') {
                 $pluginIsEngineStylePackage = $true
             }
@@ -940,7 +1277,6 @@ If it is not, double-check the archive_url in packs.json and the Drive sharing s
             }
 
             if ($upluginJson) {
-                # Show some basic metadata for visibility.
                 Write-Host "Plugin descriptor:" -ForegroundColor Cyan
                 Write-Host "  Name:        $($upluginJson.FriendlyName)"
                 Write-Host "  VersionName: $($upluginJson.VersionName)"
@@ -959,10 +1295,9 @@ If it is not, double-check the archive_url in packs.json and the Drive sharing s
                 }
             }
 
-            # HARD BLOCK: engine-style plugin packages are not supported by assetlib.
             if ($pluginIsEngineStylePackage) {
                 Write-Warning @"
-The plugin archive for '$Id' appears to be structured as an Engine-level plugin
+The plugin folder for '$Id' appears to be structured as an Engine-level plugin
 (it contains an 'Engine/Plugins' path). assetlib does not support installing
 engine-level plugins at all.
 
@@ -996,7 +1331,6 @@ require manual installation into Engine/Plugins with elevated permissions.
                 }
             }
 
-            # Engine version compatibility check for plugins
             if ($projectEngineMajor -ne $null -and $pluginEngineMajor -ne $null) {
                 if ($pluginEngineMajor -ne $projectEngineMajor) {
                     $msg = "Plugin '$Id' targets engine major version $pluginEngineMajor (from .uplugin) but the project appears to use $projectEngineMajor.x."
@@ -1030,7 +1364,6 @@ require manual installation into Engine/Plugins with elevated permissions.
                 }
             }
 
-            # Warn if plugin has C++ modules but project appears to be Blueprint-only.
             if ($pluginHasCppModules -and -not $projectHasCppModules) {
                 Write-Warning @"
 Plugin '$Id' contains C++ modules, but the project appears to be Blueprint-only
@@ -1040,7 +1373,6 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
             }
         }
 
-        # Soft engineVersion checks for content packs (and plugin pack engineVersion tag).
         if ($pack.engineVersion -and $projectEngineMajor -ne $null) {
             if ($pack.engineVersion -match '^(\d+)\.(\d+)') {
                 $packMajor = [int]$Matches[1]
@@ -1052,28 +1384,15 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
             }
         }
 
-        # Now we inspect the extracted structure to avoid double-nesting like:
-        #   Content\AssetLib\<id>\<id>\<content>
-        #
-        # Strategy:
-        #   - If the temp extract root contains exactly ONE top-level directory
-        #     and NO files, treat that directory as a wrapper folder and move
-        #     its CONTENTS into targetPath (flattening).
-        #   - Otherwise, move everything from the temp extract root into targetPath.
+        $localRootEntries = Get-ChildItem -Path $localPackFolder
 
-        $topEntries = Get-ChildItem -Path $tempExtract
-        $topDirs = $topEntries | Where-Object { $_.PSIsContainer }
-        $topFiles = $topEntries | Where-Object { -not $_.PSIsContainer }
-
-        # Ensure targetPath exists before moving content.
         if (-not (Test-Path $targetPath)) {
             New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
         }
 
-        if ($topDirs.Count -eq 1 -and $topFiles.Count -eq 0) {
-            # Single wrapper directory case: flatten it.
-            $wrapperDir = $topDirs[0]
-            Write-Host "Detected single top-level folder '$($wrapperDir.Name)' in archive. Flattening into '$targetPath' to avoid double nesting..."
+        if ($localRootEntries.Count -eq 1 -and $localRootEntries[0].PSIsContainer) {
+            $wrapperDir = $localRootEntries[0]
+            Write-Host "Detected single top-level folder '$($wrapperDir.Name)' in MEGA pack. Flattening into '$targetPath' to avoid double nesting..."
 
             Get-ChildItem -Path $wrapperDir.FullName | ForEach-Object {
                 $dest = Join-Path $targetPath $_.Name
@@ -1081,9 +1400,8 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
             }
         }
         else {
-            # Mixed files/folders or multiple top-level entries: move them all as-is.
-            Write-Host "Archive has multiple top-level entries or files; copying structure into '$targetPath'..."
-            Get-ChildItem -Path $tempExtract | ForEach-Object {
+            Write-Host "Copying MEGA pack structure into '$targetPath'..." -ForegroundColor Cyan
+            Get-ChildItem -Path $localPackFolder | ForEach-Object {
                 $dest = Join-Path $targetPath $_.Name
                 Move-Item -LiteralPath $_.FullName -Destination $dest -Force
             }
@@ -1092,21 +1410,15 @@ to a C++ project (e.g., by adding a C++ class once) for the plugin to fully work
         Write-Host "Installed pack '$Id' to '$targetPath' (licenseMode=$licenseMode)." -ForegroundColor Green
     }
     catch {
-        Write-Error "Failed while moving or processing extracted content for '$Id' into '$targetPath': $($_.Exception.Message)"
+        Write-Error "Failed while moving or processing downloaded content for '$Id' into '$targetPath': $($_.Exception.Message)"
     }
     finally {
-        # Clean up temp locations if they exist.
-        if (Test-Path $tempFile) {
-            Remove-Item $tempFile -Force
-        }
-        if (Test-Path $tempExtract) {
-            Remove-Item $tempExtract -Recurse -Force
+        if (Test-Path $tempDownload) {
+            Remove-Item $tempDownload -Recurse -Force
         }
     }
 }
 
-# Uninstall a pack from the current Unreal project root.
-# Deletes the installed folder determined by packType, without touching packs.json.
 function Uninstall-AssetPackFromProject {
     param(
         [Parameter(Mandatory = $true)]
@@ -1127,7 +1439,6 @@ function Uninstall-AssetPackFromProject {
         return
     }
 
-    # Prevent uninstalling while Unreal Editor is running unless -Force is used
     if (Test-UnrealEditorRunning) {
         if (-not $Force) {
             Write-Error "Unreal Editor appears to be running. Close the editor before uninstalling a pack, or run again with -Force to override."
@@ -1137,7 +1448,6 @@ function Uninstall-AssetPackFromProject {
             Write-Warning "Unreal Editor appears to be running. Forcing uninstall anyway."
         }
     }
-
 
     $targetPath = Get-AssetPackInstallPath -Pack $pack -ProjectRoot $projectRoot
 
@@ -1155,7 +1465,6 @@ function Uninstall-AssetPackFromProject {
         }
     }
 
-    # Safety: ensure we are deleting under projectRoot
     if (-not $targetPath.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Error "Resolved uninstall path '$targetPath' is not under project root '$projectRoot'. Aborting for safety."
         return
@@ -1174,14 +1483,6 @@ function Uninstall-AssetPackFromProject {
 
 # region: Audit & prune -------------------------------------------------------
 
-# Audit all packs against license rules:
-# - NO-LICENSE: licenseId missing
-# - UNKNOWN-LICENSE: licenseId not found in licenses.json
-# - NON-COMMERCIAL: commercialAllowed == false
-# - OK: commercialAllowed == true
-#
-# If -Prune is provided, and licenseMode is 'restrictive', removes installed packs
-# from the current Unreal project based on license selection rules.
 function Test-AssetPackLicenses {
     param(
         [switch]$Prune,
@@ -1190,7 +1491,7 @@ function Test-AssetPackLicenses {
     )
 
     $packs = Get-AssetPackManifest
-    $licenses = Get-AssetLicenseManifest
+    $licensesManifest = Get-AssetLicenseManifest
     $config = Get-AssetLibConfig
 
     if (-not $packs -or $packs.Count -eq 0) {
@@ -1205,8 +1506,7 @@ function Test-AssetPackLicenses {
     Write-Host "------------------------------------------------------------"
 
     foreach ($p in $packs) {
-        $status = Get-AssetPackLicenseStatus -Pack $p -Licenses $licenses
-
+        $status = Get-AssetPackLicenseStatus -Pack $p -Licenses $licensesManifest
         $id = $p.id
         $name = $p.name
         $licenseId = $p.licenseId
@@ -1249,7 +1549,6 @@ function Test-AssetPackLicenses {
         return
     }
 
-    # From here on we are in prune mode: delete installed packs in the current project.
     if ($config.licenseMode -ne 'restrictive') {
         Write-Error "audit -Prune is only allowed in 'restrictive' license mode (current mode: '$($config.licenseMode)'). Use 'assetlib mode restrictive' to switch."
         return
@@ -1261,7 +1560,6 @@ function Test-AssetPackLicenses {
         return
     }
 
-    # Prevent pruning while Unreal Editor is running unless -Force is used
     if (Test-UnrealEditorRunning) {
         if (-not $Force) {
             Write-Error "Unreal Editor appears to be running. Close the editor before pruning installed packs, or run again with -Force to override."
@@ -1272,7 +1570,6 @@ function Test-AssetPackLicenses {
         }
     }
 
-
     $targetsToRemove = New-Object System.Collections.Generic.List[object]
 
     foreach ($entry in $results) {
@@ -1280,7 +1577,6 @@ function Test-AssetPackLicenses {
         $status = $entry.Status
         $lid = $entry.LicenseId
 
-        # Determine if this pack is installed in the current project.
         $installPath = Get-AssetPackInstallPath -Pack $pack -ProjectRoot $projectRoot
         if (-not (Test-Path $installPath)) {
             continue
@@ -1289,11 +1585,10 @@ function Test-AssetPackLicenses {
         $shouldRemove = $false
 
         if ($Licenses -and $Licenses.Count -gt 0) {
-            # Explicit license selection.
             if (-not $lid) {
                 if ($Licenses -contains 'NO-LICENSE') { $shouldRemove = $true }
             }
-            elseif (-not ($licenses | Where-Object { $_.id -eq $lid })) {
+            elseif (-not ($licensesManifest | Where-Object { $_.id -eq $lid })) {
                 if ($Licenses -contains 'UNKNOWN-LICENSE') { $shouldRemove = $true }
             }
             else {
@@ -1301,7 +1596,6 @@ function Test-AssetPackLicenses {
             }
         }
         else {
-            # Default behavior: remove all installed packs that are not commercial-safe.
             if ($status -ne 'OK') {
                 $shouldRemove = $true
             }
@@ -1338,7 +1632,6 @@ function Test-AssetPackLicenses {
     foreach ($t in $targetsToRemove) {
         $path = $t.Path
 
-        # Safety: ensure we only delete inside the project root.
         if (-not $path.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
             Write-Error "Skipping removal of '$($t.Pack.id)': resolved path '$path' is not under project root '$projectRoot'."
             continue
@@ -1358,7 +1651,6 @@ function Test-AssetPackLicenses {
 
 # region: License mode --------------------------------------------------------
 
-# Show or set license mode (restrictive/permissive).
 function GetSet-AssetLibMode {
     param(
         [string]$Mode
@@ -1388,32 +1680,17 @@ function GetSet-AssetLibMode {
 
 # region: Help -----------------------------------------------------------------
 
-# Expanded, topic-aware help.
-# Supports:
-#   assetlib help
-#   assetlib help list
-#   assetlib help show
-#   assetlib help open
-#   assetlib help add
-#   assetlib help remove
-#   assetlib help licenses
-#   assetlib help audit
-#   assetlib help install
-#   assetlib help uninstall
-#   assetlib help mode
 function Show-AssetLibHelp {
     param(
         [string]$Topic
     )
 
-    # Normalize for matching.
     $topicKey = $Topic
     if ($topicKey) {
         $topicKey = $topicKey.ToLowerInvariant()
     }
 
     switch ($topicKey) {
-        # ---------------------------------------------------------------------
         "list" {
             @"
 assetlib help list
@@ -1423,22 +1700,9 @@ Usage:
 
 Description:
   Lists packs from packs.json, optionally filtered by category and/or tag.
-
-Examples:
-  assetlib list
-  assetlib list -Category animations
-  assetlib list -Tag sci-fi
-
-Details:
-  - Category and Tag are both optional.
-  - Categories and tags are arrays in packs.json.
-  - Under the hood, 'list' uses Where-Object to filter:
-      Where-Object { $_.categories -contains $Category }
-      Where-Object { $_.tags -contains $Tag }
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "show" {
             @"
 assetlib help show
@@ -1448,24 +1712,9 @@ Usage:
 
 Description:
   Prints the full JSON for a single pack from packs.json.
-
-Examples:
-  assetlib show Mco_Mocap_Basics
-
-Details:
-  - <id> must match the 'id' property of a pack in packs.json.
-  - Output is generated via ConvertTo-Json with a depth of 5, so you see:
-      - cloud_url
-      - archive_url
-      - categories
-      - tags
-      - licenseId
-      - packType
-      - pluginFolderName
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "open" {
             @"
 assetlib help open
@@ -1474,52 +1723,48 @@ Usage:
   assetlib open <id>
 
 Description:
-  Opens the pack's cloud_url in your default browser.
-
-Examples:
-  assetlib open Mco_Mocap_Basics
+  Opens the pack's MEGA folder in your default browser.
 
 Details:
-  - <id> must match the 'id' in packs.json.
-  - cloud_url is expected to be a Google Drive folder view link.
-  - The URL is opened using Start-Process, which launches the default browser.
+  - assetlib computes the MEGA path for the pack using:
+      megaRootPath (from assetlib.config.json, default '/AssetLib')
+      and pack.megaSubPath or pack.id (relative under that root).
+  - Then it runs 'mega-export' on that folder to obtain a link,
+    opens the link in the browser, and optionally revokes the export.
+  - No URLs are stored in packs.json; links are generated on demand.
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "add" {
             @"
 assetlib help add
 -----------------
 Usage:
-  assetlib add
+  assetlib add [-Force]
 
 Description:
-  Interactive wizard to add a new pack to packs.json.
+  Interactive wizard to add a new pack to packs.json and upload its content to MEGA.
 
 What it does:
-  - Optionally opens the asset store root from assetlib.config.json.
-  - Prompts for:
-      id, name, source
-      cloud_url (folder view / Google Drive)
-      archive_url (direct download ZIP, used by 'install')
-      categories (comma-separated)
-      tags (comma-separated)
-      notes
-      licenseId
-      packType (content/plugin)
-      pluginFolderName (for plugins)
-  - Applies license rules based on licenseMode from assetlib.config.json:
-      restrictive : only 'OK' licenses allowed (commercialAllowed = true).
-      permissive  : allows all, but warns on NON-COMMERCIAL/UNKNOWN/NO-LICENSE.
+  - If run from a UE project root:
+      - Offers to auto-discover pack folders under Content/ and Plugins/
+        (ignores Content/AssetLib because those are assumed installed via assetlib).
+  - Otherwise:
+      - Lets you choose a local folder via GUI dialog or manual path.
+  - Validates:
+      - id uniqueness
+      - licenseId according to licenseMode (restrictive/permissive)
+      - local path is a folder (not a .zip)
+  - Uploads the folder to MEGA via 'mega-put' into:
+      <megaRootPath>/<megaSubPath-or-id>
+  - Saves pack metadata in packs.json including 'megaSubPath' but not any URLs.
 
 Notes:
-  - This command only edits packs.json and does not touch any Unreal project.
-  - Safe to run while Unreal Editor is open.
+  - The pack content on MEGA is stored as a folder; installs use 'mega-get'
+    on the folder, not a zip file.
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "remove" {
             @"
 assetlib help remove
@@ -1528,23 +1773,14 @@ Usage:
   assetlib remove <id> [-Force]
 
 Description:
-  Removes a pack entry from packs.json only. Does NOT touch any project files
-  or Google Drive content.
-
-Examples:
-  assetlib remove Mco_Mocap_Basics
-  assetlib remove Mco_Mocap_Basics -Force
+  Removes a pack entry from packs.json and attempts to remove its MEGA folder.
 
 Details:
-  - Without -Force:
-      - You are prompted to confirm removal.
-  - With -Force:
-      - The confirmation prompt is skipped.
-  - This is manifest maintenance only, safe with Unreal open.
+  - The MEGA folder is derived from megaRootPath + pack.megaSubPath or pack.id.
+  - Uses 'mega-rm' to delete the remote folder if MEGAcmd is available.
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "licenses" {
             @"
 assetlib help licenses
@@ -1554,25 +1790,10 @@ Usage:
   assetlib licenses <licenseId>
 
 Description:
-  Manages viewing of license metadata and text.
-
-  assetlib licenses
-    - Lists all license definitions from licenses/licenses.json.
-    - Shows id, COMMERCIAL/NON-COMMERCIAL status, and name.
-
-  assetlib licenses <licenseId>
-    - Shows details for a specific license and prints the full text of the
-      associated .txt file.
-
-Notes:
-  - This command is read-only and safe with Unreal open.
-  - License enforcement for 'add', 'install', and 'audit -Prune' is based on:
-      licenseId matching licenses/licenses.json
-      commercialAllowed flag in each license entry.
+  Shows license metadata and license text from licenses/licenses.json.
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "install" {
             @"
 assetlib help install
@@ -1581,91 +1802,22 @@ Usage:
   assetlib install <id> [-Force]
 
 Description:
-  Installs a pack into the current Unreal project root by:
-    - Downloading archive_url from packs.json (with a progress bar)
-    - Extracting it into:
-        packType = content :  Content/AssetLib/<id>/
-        packType = plugin  :  Plugins/<pluginFolderName or id>/
+  Installs a pack into the current Unreal project by:
 
-Requirements:
-  - You must run this from an Unreal project root:
-      - Directory contains at least one *.uproject
-      - Directory contains a Content/ folder
-  - The pack must exist in packs.json.
-  - The pack must have archive_url set.
+    1. Computing the MEGA folder path for the pack:
+         megaRootPath + megaSubPath (or id if megaSubPath not set).
+    2. Using MEGAcmd 'mega-get' to download that folder into a temporary
+       local directory.
+    3. Inspecting it for plugin metadata if packType=plugin (same as before).
+    4. Copying the content into:
+         packType = content :  Content/AssetLib/<id>/
+         packType = plugin  :  Plugins/<pluginFolderName or id>/
 
-License behavior:
-  - licenseMode = restrictive:
-      - Only installs packs whose license status is 'OK'
-        (licenseId known and commercialAllowed = true).
-  - licenseMode = permissive:
-      - Installs anything but warns on NON-COMMERCIAL/UNKNOWN/NO-LICENSE.
-
-Engine compatibility:
-  - For plugins (packType=plugin):
-      - The .uplugin file is inspected for EngineVersion.
-      - The .uproject is inspected for EngineVersion / EngineAssociation.
-      - Major-version mismatch (e.g. plugin 4.x vs project 5.x):
-          - INSTALL IS BLOCKED by default; -Force is required to override.
-      - Plugin newer than project (5.4 plugin on 5.3 project):
-          - INSTALL IS BLOCKED by default; -Force is required.
-      - Plugin older than project (5.2 plugin on 5.3 project):
-          - INSTALL IS BLOCKED by default; -Force is required, with a warning that
-            many plugins do work across minor upgrades but must be tested.
-
-  - For content packs (packType=content):
-      - Optional engineVersion metadata in packs.json (e.g. "5.3") is used for
-        soft warnings if it does not match the project engine. Content is often
-        portable across minor versions, so installs are not blocked.
-
-C++ vs Blueprint-only projects:
-  - If a plugin has C++ modules (Modules array in .uplugin) and the .uproject
-    has no Modules (Blueprint-only project), assetlib prints a warning that
-    the project may need to be converted to C++ (e.g. by adding a C++ class)
-    for the plugin to fully work.
-
-Engine-level plugins:
-  - Some plugin zips are structured for Engine-level install, containing paths
-    like 'Engine/Plugins/...'.
-  - assetlib DOES NOT SUPPORT engine-level plugin installs at all.
-      - When such a package is detected:
-          - The install is hard-blocked (no -Force override).
-          - You are prompted to:
-              - Keep the pack in packs.json for tracking only, or
-              - Remove the pack from packs.json entirely.
-      - If you need such a plugin, install it manually into Engine/Plugins.
-
-Editor safety:
-  - If Unreal Editor is running:
-      - Without -Force: install is blocked and you are asked to close the editor.
-      - With -Force   : a warning is shown and install proceeds anyway.
-  - Recommended: close Unreal before installing, especially for plugins.
-
-Overwrite behavior:
-  - If target folder already exists:
-      - Without -Force:
-          - You are prompted before removing the existing folder.
-      - With -Force:
-          - Existing folder is removed without prompting.
-
-ZIP handling & structure:
-  - The download is validated as a ZIP (checks for 'PK' header).
-  - Archives are extracted to a temporary folder first.
-  - If the archive contains exactly one top-level folder and no files, that
-    folder is treated as a wrapper and its CONTENTS are moved into the final
-    target path to avoid double-nesting:
-      Content/AssetLib/<id>/<id>/<content> -> Content/AssetLib/<id>/<content>
-  - Otherwise, all top-level entries in the archive are moved into the target
-    path as-is.
-
-Progress:
-  - The download step uses a streaming HTTP client and Write-Progress to show
-    a progress bar in the terminal as bytes are downloaded.
+Notes:
+  - No zip files are used anymore; everything is folder-based.
 "@ | Write-Host
         }
 
-
-        # ---------------------------------------------------------------------
         "uninstall" {
             @"
 assetlib help uninstall
@@ -1674,37 +1826,11 @@ Usage:
   assetlib uninstall <id> [-Force]
 
 Description:
-  Removes an installed pack from the current Unreal project by deleting the
-  folder where it was installed:
-
-    packType = content :  Content/AssetLib/<id>/
-    packType = plugin  :  Plugins/<pluginFolderName or id>/
-
-Requirements:
-  - Must be run from an Unreal project root (has *.uproject + Content/).
-  - The pack id must exist in packs.json.
-  - The computed install folder must exist to be removed.
-
-License:
-  - Licenses are NOT re-checked for uninstall; this is purely a project cleanup
-    operation.
-
-Editor safety:
-  - If Unreal Editor is running:
-      - Without -Force: uninstall is blocked with an error.
-      - With -Force   : a warning is printed and uninstall proceeds.
-  - Strongly recommended: close Unreal Editor before uninstalling to avoid
-    deleting in-use assets or plugins.
-
-Prompting:
-  - Without -Force:
-      - You are prompted before deleting the install folder.
-  - With -Force:
-      - Deletes without prompting.
+  Removes an installed pack's files from the current Unreal project, based on
+  its packType (Content/AssetLib/<id>/ or Plugins/<pluginFolderName or id>/).
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "audit" {
             @"
 assetlib help audit
@@ -1714,49 +1840,11 @@ Usage:
   assetlib audit -Prune [-Licenses <id|NO-LICENSE|UNKNOWN-LICENSE> ...] [-Force]
 
 Description:
-  Read-only audit:
-    assetlib audit
-      - Classifies each pack as:
-          OK
-          NON-COMMERCIAL
-          UNKNOWN-LICENSE
-          NO-LICENSE
-      - DOES NOT delete anything.
-      - Safe to run with Unreal Editor open.
-
-  Prune mode (destructive, project-specific):
-    assetlib audit -Prune [...]
-      - Only allowed when:
-          licenseMode = 'restrictive'
-          current directory is an Unreal project root
-          Unreal Editor is not running (unless -Force)
-      - Deletes installed packs from THIS PROJECT ONLY based on license rules.
-
-Default prune behavior (no -Licenses):
-  - Removes installed packs whose license status is NOT 'OK':
-      NON-COMMERCIAL, UNKNOWN-LICENSE, NO-LICENSE.
-
-Explicit prune selection with -Licenses:
-  - Removes only installed packs whose license matches one of:
-      - Named license ids (e.g. Fab_Standard_License)
-      - Special pseudo-ids:
-          NO-LICENSE      : packs with missing licenseId
-          UNKNOWN-LICENSE : packs whose licenseId is not in licenses.json
-
-Editor safety:
-  - If Unreal Editor is running:
-      - Without -Force: prune is blocked with an error.
-      - With -Force   : a warning is printed and prune proceeds.
-
-Prompts:
-  - Without -Force:
-      - Shows a list of installed packs to be removed and prompts for confirmation.
-  - With -Force:
-      - Skips confirmation.
+  Audits licenses for all packs in packs.json and optionally prunes installed
+  packs from the current project if licenseMode is 'restrictive'.
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         "mode" {
             @"
 assetlib help mode
@@ -1767,31 +1855,18 @@ Usage:
   assetlib mode permissive
 
 Description:
-  Manages the global licenseMode stored in assetlib.config.json.
+  Shows or sets the global licenseMode in assetlib.config.json.
 
-  assetlib mode
-    - Shows the current license mode and a short explanation.
-
-  assetlib mode restrictive
-    - Sets licenseMode to 'restrictive'.
-    - Effects:
-        - 'add' only accepts packs with OK licenses.
-        - 'install' only installs packs with OK licenses.
-        - 'audit -Prune' is allowed (and required for pruning).
-
-  assetlib mode permissive
-    - Sets licenseMode to 'permissive'.
-    - Effects:
-        - 'add' and 'install' allow any license but warn on problematic ones.
-        - 'audit -Prune' is disabled for safety.
+  megaRootPath:
+    - Also stored in assetlib.config.json (default '/AssetLib').
+    - All pack MEGA paths are derived from it and the pack's megaSubPath or id.
 "@ | Write-Host
         }
 
-        # ---------------------------------------------------------------------
         default {
             @"
-assetlib - shared asset pack manifest & Unreal helper
-=====================================================
+assetlib - shared asset pack manifest & Unreal helper (MEGA-native, folder-based)
+=================================================================================
 
 Overview
 --------
@@ -1799,22 +1874,35 @@ assetlib is a small PowerShell tool that:
 
   - Tracks asset packs in packs.json
   - Stores license metadata in licenses/licenses.json
-  - Opens Google Drive folders for packs
+  - Uses MEGAcmd to:
+      - Upload local pack folders to MEGA (mega-put)
+      - Download pack folders from MEGA (mega-get)
+      - Export pack folders as short-lived-ish browser links (mega-export)
   - Installs/uninstalls packs into an Unreal project
   - Audits and prunes installed packs based on license rules
   - Enforces a configurable license mode: restrictive or permissive
 
-By design:
-  - ZERO dependencies beyond PowerShell and built-in modules.
-  - Friendly for non-technical teammates (copy/paste commands).
-  - NEVER edits Unreal engine folders, only the current project.
+Key MEGA concepts
+-----------------
+  - megaRootPath (config):
+      Root folder on MEGA where all packs live. Default: '/AssetLib'.
 
-IMPORTANT:
-  - Calling 'assetlib' with no arguments throws:
-      assetlib requires a command. Run 'assetlib help' for usage.
+  - megaSubPath (per-pack):
+      Optional relative subpath under megaRootPath.
+      If not set, the pack uses '<megaRootPath>/<id>'.
 
-Quick command summary
----------------------
+  - MEGA folder layout:
+      For a pack with id = 'fab_scifi_soldier_pro_pack':
+        - megaRootPath = '/AssetLib'
+        - megaSubPath  = 'fab_scifi_soldier_pro_pack'
+        => Remote MEGA folder: '/AssetLib/fab_scifi_soldier_pro_pack'
+
+  - No archive_url, no cloud_url:
+      assetlib no longer stores URLs or zip locations.
+      Everything is folder-based and derived from MEGA paths.
+
+Core commands
+-------------
   assetlib help
   assetlib help <command>
 
@@ -1822,7 +1910,7 @@ Quick command summary
   assetlib show <id>
   assetlib open <id>
 
-  assetlib add
+  assetlib add [-Force]
   assetlib remove <id> [-Force]
 
   assetlib licenses [<licenseId>]
@@ -1839,50 +1927,25 @@ Quick command summary
 
 Editor safety
 -------------
-Commands that ONLY read or edit JSON/config are safe while Unreal Editor is open:
+  - Commands that only touch JSON/config are safe while Unreal Editor is open:
+      help, list, show, open, add, remove, licenses, audit (without -Prune), mode
 
-  - help, list, show, open
-  - add, remove
-  - licenses
-  - audit (without -Prune)
-  - mode
+  - Commands that modify a project (Content/ or Plugins/) are editor-sensitive:
+      install, uninstall, audit -Prune
 
-Commands that modify a project (Content/ or Plugins/) are editor-sensitive:
+    For those, assetlib:
+      - Detects Unreal Editor processes.
+      - Blocks operations if the editor appears to be running, unless -Force is used.
+      - With -Force, prints a warning and proceeds.
 
-  - install, uninstall, audit -Prune
-
-For those, assetlib:
-
-  - Detects Unreal Editor processes (UnrealEditor*, UE4Editor, UE5Editor).
-  - Blocks operations when the editor appears to be running, unless -Force is used.
-  - With -Force, prints a warning and proceeds.
-
-Recommended workflow
+MEGAcmd expectations
 --------------------
-  - Use 'assetlib add' and 'assetlib remove' to maintain packs.json.
-  - Use 'assetlib licenses' to understand license definitions.
-  - Use 'assetlib mode' to switch between restrictive and permissive license behavior.
-  - Before shipping:
-      - Run 'assetlib audit' to check license health.
-  - For a specific Unreal project:
-      - Close Unreal Editor.
-      - From the project root:
-          - Use 'assetlib install <id>' to bring in new content/plugins.
-          - Use 'assetlib uninstall <id>' to remove a specific pack.
-          - Use 'assetlib audit -Prune' to clean out non-commercial/unknown/no-license
-            packs from THIS PROJECT ONLY.
-
-For detailed help on any command:
-  - assetlib help list
-  - assetlib help show
-  - assetlib help open
-  - assetlib help add
-  - assetlib help remove
-  - assetlib help licenses
-  - assetlib help install
-  - assetlib help uninstall
-  - assetlib help audit
-  - assetlib help mode
+  - MEGAcmd must be installed and on PATH.
+  - The user must be logged in (mega-login).
+  - The installer script (Install-AssetLib.ps1) is responsible for bootstrap:
+      - Installing MEGAcmd
+      - Adding it to PATH
+      - Guiding the user through MEGAcmd login.
 "@ | Write-Host
         }
     }
@@ -1894,8 +1957,12 @@ For detailed help on any command:
 
 try {
     switch ($Command) {
-        "help" { Show-AssetLibHelp -Topic $Id }
-        "list" { Get-AssetPackList -Category $Category -Tag $Tag }
+        "help" {
+            Show-AssetLibHelp -Topic $Id
+        }
+        "list" {
+            Get-AssetPackList -Category $Category -Tag $Tag
+        }
         "show" {
             if (-not $Id) {
                 Write-Error "You must provide an id, e.g. assetlib show Mco_Mocap_Basics"
@@ -1912,7 +1979,9 @@ try {
                 Open-AssetPack -Id $Id
             }
         }
-        "add" { Add-AssetPack }
+        "add" {
+            Add-AssetPack
+        }
         "remove" {
             if (-not $Id) {
                 Write-Error "You must provide an id, e.g. assetlib remove Mco_Mocap_Basics"
@@ -1957,7 +2026,6 @@ try {
     }
 }
 catch {
-    # Top-level catch for unexpected errors. We rethrow after logging so calling tools can see a non-zero exit.
     Write-Error "assetlib failed: $($_.Exception.Message)"
     throw
 }

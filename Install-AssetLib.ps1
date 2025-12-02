@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 
+# -----------------------------------------------------------------------------
+# Paths & basic setup
+# -----------------------------------------------------------------------------
+
 # Ensure the directory that contains the PowerShell profile exists.
 # $PROFILE is the full path to the current user's profile script.
 # Docs: https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_profiles
@@ -15,62 +19,531 @@ if (-not (Test-Path $PROFILE)) {
 
 # Resolve full path to assetlib.ps1 in this repo (where you run this installer).
 $scriptPath = (Resolve-Path ".\assetlib.ps1").Path
-$repoRoot   = Split-Path $scriptPath -Parent
+$repoRoot = Split-Path $scriptPath -Parent
 $configPath = Join-Path $repoRoot "assetlib.config.json"
 
-# One-time config: ask user for their asset store root URL and store it in
-# assetlib.config.json, if not already present. Also initialize licenseMode.
+# -----------------------------------------------------------------------------
+# Helper: check if MEGAcmd CLI is actually usable (primary truth)
+# -----------------------------------------------------------------------------
+
+function Test-MegaCmdCliAvailable {
+    <#
+        Returns $true if running 'mega-help' appears to work, $false otherwise.
+
+        IMPORTANT:
+        - We treat "command works" as the main indicator.
+        - We DO NOT trust the presence of the MEGAcmd folder alone, since
+          sloppy uninstalls can leave it behind.
+    #>
+    try {
+        # Init MEGAcmd server process.
+        $proc = Start-Process mega-version `
+            -NoNewWindow `
+            -PassThru `
+            -RedirectStandardOutput "$env:TEMP\mega-safe.out" `
+            -RedirectStandardError "$env:TEMP\mega-safe.err"
+
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { $proc.Kill() } catch {}
+        }
+      
+        $output = mega-help
+        if ($? -or ($output -and $output -match 'MEGAcmd')) {
+            return $true
+        }
+
+    }
+    catch {
+        # Command not found / not on PATH / not installed.
+        return $false
+    }
+    return $false
+}
+
+# -----------------------------------------------------------------------------
+# Helper: add MEGAcmd folder to *current* process PATH if needed
+# -----------------------------------------------------------------------------
+
+function Add-MegaCmdToCurrentPath {
+    $megaDir = Join-Path $env:LOCALAPPDATA 'MEGAcmd'
+    if (-not (Test-Path $megaDir)) {
+        return
+    }
+
+    $pathParts = $env:PATH -split ';'
+    if ($pathParts -contains $megaDir) {
+        return
+    }
+
+    if ($env:PATH -and $env:PATH[-1] -ne ';') {
+        $env:PATH += ';'
+    }
+    $env:PATH += $megaDir
+}
+
+# -----------------------------------------------------------------------------
+# Helper: ensure MEGAcmd is installed (silent installer + bounded wait),
+# and usable by CLI (mega-help)
+# -----------------------------------------------------------------------------
+
+function Install-MegaCmdIfMissing {
+    <#
+        Ensures MEGAcmd CLI is available.
+
+        Strategy:
+        1. If 'mega-help' already works, do nothing.
+        2. Otherwise, if %LOCALAPPDATA%\MEGAcmd exists:
+           - Add it to PATH for this process and check again.
+        3. If it still doesn't work:
+           - Download MEGAcmdSetup64.exe into %TEMP%.
+           - Run it with /S (silent) using ProcessStartInfo.
+           - Hard timeout: 60 seconds.
+           - If it doesn't exit in time, kill it and ask user to run manually.
+        4. After install, add MEGAcmd folder to *this* process PATH and
+           re-check 'mega-help'.
+    #>
+
+    if (Test-MegaCmdCliAvailable) {
+        Write-Host "MEGAcmd already available." -ForegroundColor Green
+        return
+    }
+
+    # Try to salvage an existing install by adding folder to PATH
+    Add-MegaCmdToCurrentPath
+    if (Test-MegaCmdCliAvailable) {
+        Write-Host "MEGAcmd CLI became available after adding %LOCALAPPDATA%\MEGAcmd to PATH." -ForegroundColor Green
+        return
+    }
+
+    $tempDir = [System.IO.Path]::GetTempPath()
+    $installer = Join-Path $tempDir "MEGAcmdSetup64.exe"
+    $downloadUrl = "https://mega.nz/MEGAcmdSetup64.exe"
+
+    Write-Host "MEGAcmd does not appear to be installed or on PATH." -ForegroundColor Yellow
+    Write-Host "Downloading MEGAcmd installer from $downloadUrl ..." -ForegroundColor Cyan
+
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $installer -UseBasicParsing
+    }
+    catch {
+        Write-Error "Failed to download MEGAcmd installer: $($_.Exception.Message)"
+        return
+    }
+
+    if (-not (Test-Path $installer)) {
+        Write-Error "MEGAcmd installer download failed; file not found at: $installer"
+        return
+    }
+
+    Write-Host "Running MEGAcmd installer silently (/S). This may take up to ~60 seconds..." -ForegroundColor Cyan
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $installer
+    $psi.Arguments = "/S"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if (-not $proc) {
+            Write-Error "Failed to start MEGAcmd installer process."
+            return
+        }
+    }
+    catch {
+        Write-Error "Failed to start MEGAcmd installer: $($_.Exception.Message)"
+        return
+    }
+
+    # Hard timeout: 60 seconds
+    $timeoutMs = 60000
+    $exited = $proc.WaitForExit($timeoutMs)
+
+    # Grab any output that might be available (non-blocking now that WaitForExit returned)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+
+    if (-not $exited) {
+        # Kill the process to avoid "hanging" forever.
+        try { $proc.Kill() } catch {}
+
+        Write-Error @"
+MEGAcmd installer did not exit within $($timeoutMs / 1000) seconds and has been terminated.
+
+STDOUT:
+$stdout
+
+STDERR:
+$stderr
+
+Please try running the installer manually:
+  $installer
+
+After installation completes, open a new PowerShell session and verify:
+  mega-help
+
+Then re-run this Install-AssetLib.ps1 script.
+"@
+        return
+    }
+    
+    if (-not $proc.ExitCode -eq 0) {
+        Write-Host "MEGAcmd installer exited with non-zero exit code $($proc.ExitCode)." -ForegroundColor DarkRed
+        if ($stderr) {
+            Write-Host "Installer STDERR:" -ForegroundColor DarkRed
+            Write-Host $stderr
+        }
+    }
+    else {
+        Write-Host "MEGAcmd installer completed successfully." -ForegroundColor Green
+        if ($stdout) {
+            Write-Host "Installer STDOUT:" -ForegroundColor DarkGray
+            Write-Host $stdout
+        }
+    }
+    
+
+    if ($proc.ExitCode -ne 0) {
+        Write-Error @"
+MEGAcmd installer exited with non-zero code $($proc.ExitCode).
+
+Please run the installer manually:
+  $installer
+
+Then open a new PowerShell session and verify:
+  mega-help
+
+After that, re-run this Install-AssetLib.ps1 script.
+"@
+        return
+    }
+    # Try to make the CLI available in this process too.
+    Add-MegaCmdToCurrentPath
+    if (-not (Test-MegaCmdCliAvailable)) {
+        Write-Warning @"
+MEGAcmd installer completed (exit code 0), but 'mega-help' still does not work
+in this PowerShell session.
+
+Most likely, your PATH changes will apply only to NEW sessions.
+
+Suggested steps:
+  1. Close this PowerShell window.
+  2. Open a NEW PowerShell window.
+  3. Run: mega-help
+  4. Then re-run this Install-AssetLib.ps1 script to finish setup.
+"@
+        return
+    }
+
+    Write-Host "MEGAcmd installed and mega-help is now working in this session." -ForegroundColor Green
+}
+# -----------------------------------------------------------------------------
+# Helper: Update Path env to include MEGAcmd for current session
+# -----------------------------------------------------------------------------
+function Add-ToCurrentSessionPath {
+    # Refresh current process PATH from system + user env
+    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+
+    $env:Path = if ($machinePath -and $userPath) {
+        "$machinePath;$userPath"
+    }
+    elseif ($machinePath) {
+        $machinePath
+    }
+    else {
+        $userPath
+    }
+
+}
+# -----------------------------------------------------------------------------
+# Helper: update profile (assetlib function + MEGAcmd PATH snippet)
+# -----------------------------------------------------------------------------
+
+function Update-ProfileForAssetLibAndMega {
+    <#
+        Ensures the PowerShell profile contains:
+          - a single 'assetlib' function pointing at this repo's assetlib.ps1
+          - a single MEGAcmd PATH snippet
+
+        Strategy:
+          - Keep everything BEFORE the last 'function assetlib' as-is.
+          - Delete everything from that 'function assetlib' onward.
+          - Append a fresh, clean assetlib function + MEGAcmd PATH block.
+    #>
+
+    # Read entire profile as a single string (or empty if it doesn't exist yet)
+    $profileContent = Get-Content -Path $PROFILE -Raw -ErrorAction SilentlyContinue
+    if (-not $profileContent) {
+        $profileContent = ""
+    }
+
+    # Find the last occurrence of 'function assetlib' (case-insensitive)
+    $marker = 'function assetlib'
+    $index = $profileContent.LastIndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase)
+
+    if ($index -ge 0) {
+        # Keep everything before the assetlib block
+        $prefix = $profileContent.Substring(0, $index)
+    }
+    else {
+        # No previous assetlib block; keep the profile as-is
+        $prefix = $profileContent
+    }
+
+    # Normalize trailing whitespace and leave two blank lines before our block
+    $prefix = $prefix.TrimEnd() + "`r`n`r`n"
+
+    # Fresh assetlib function pointing at this repo's assetlib.ps1
+    $assetlibFunction = @"
+function assetlib {
+    if (`$args.Count -eq 0) {
+        throw 'assetlib requires a command. Run ''assetlib help'' for usage.'
+    }
+    & "$scriptPath" @args
+}
+"@
+
+    # Fresh MEGAcmd PATH snippet (single instance)
+    $megaPathSnippet = @"
+# Ensure MEGAcmd is on PATH for this session
+if (`$env:LOCALAPPDATA -and (Test-Path (Join-Path `$env:LOCALAPPDATA 'MEGAcmd'))) {
+    if (-not (`$env:PATH -split ';' | Where-Object { `$_ -eq (Join-Path `$env:LOCALAPPDATA 'MEGAcmd') })) {
+        if (`$env:PATH -and `$env:PATH[-1] -ne ';') {
+            `$env:PATH += ';'
+        }
+        `$env:PATH += (Join-Path `$env:LOCALAPPDATA 'MEGAcmd')
+    }
+}
+"@
+
+    $final = $prefix + $assetlibFunction + "`r`n" + $megaPathSnippet + "`r`n"
+    Set-Content -Path $PROFILE -Value $final -Encoding UTF8
+    # Reload the profile in the current session to apply changes immediately
+    try {
+        Add-ToCurrentSessionPath
+    } catch {
+        Write-Host "Failed to add to PATH in current session: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    Write-Host "Updated PowerShell profile successfully." -ForegroundColor Green
+}
+
+
+# -----------------------------------------------------------------------------
+# Helper: MEGAcmd login wizard (runs mega-login for the user)
+# -----------------------------------------------------------------------------
+
+function Invoke-MegaCmdLoginWizard {
+    <#
+        Guides the user through logging into MEGAcmd by calling:
+
+            mega-login <email> <password>
+
+        Behavior:
+        - Skips if MEGAcmd is not available.
+        - Skips if already logged in (per mega-session).
+        - Interactive login with retry loop:
+            * On failure, lets the user:
+                - [R]etry with same email
+                - [C]hange email and retry
+                - [S]kip / give up
+        - On successful CLI login:
+            * Prints email + password in the terminal.
+            * Opens https://mega.nz/login in the default browser.
+            * Waits for the user to press Enter so the credentials remain
+              the most recent terminal output while they log in via browser.
+
+        SECURITY NOTE:
+        - This wizard explicitly prints the password back to the terminal
+          *once*, assuming this is a trusted dev box.
+    #>
+
+    if (-not (Test-MegaCmdCliAvailable)) {
+        Write-Warning "MEGAcmd CLI is not available (mega-help failed). Skipping login wizard."
+        return
+    }
+
+    # Check if already logged in
+    $session = mega-session 2>$null
+    if ($session -and $session -notmatch 'Not logged in') {
+        Write-Host "You appear to be already logged into MEGAcmd." -ForegroundColor Green
+        Write-Host "Current session info: $session"
+        return
+    }
+
+    Write-Host ""
+    Write-Host "MEGAcmd Login Wizard" -ForegroundColor Cyan
+    Write-Host "------------------------------------------------------"
+    Write-Host "assetlib uses MEGAcmd to download packs from MEGA."
+    Write-Host "You only need to log into MEGAcmd once per machine."
+    Write-Host ""
+    $maxAttempts = 5
+    $attempt     = 0
+    $email       = $null
+
+    while ($true) {
+        $attempt++
+
+        if (-not $email) {
+            $email = Read-Host "MEGA account email"
+            if (-not $email) {
+                Write-Host "No email entered; skipping MEGAcmd login." -ForegroundColor Yellow
+                return
+            }
+        }
+        $plainPwd = Read-Host "MEGA account password"
+        # If we want to go back to secure string handling, uncomment this block and comment out the plain text version above.
+        # $securePwd = Read-Host "MEGA account password (input will not echo)" -AsSecureString
+        # if (-not $securePwd) {
+        #     Write-Host "No password entered; skipping MEGAcmd login." -ForegroundColor Yellow
+        #     return
+        # }
+        # 
+        ## Convert SecureString to plain text briefly to call mega-login
+        # $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd)
+        # try {
+        #     $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringUni($bstr)
+        # }
+        # finally {
+        #     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        # }
+
+        Write-Host "Running 'mega-login $email $plainPwd' via MEGAcmd..." -ForegroundColor Cyan
+
+        try {
+            $output  = mega-login $email $plainPwd 2>&1
+            $success = $?
+        }
+        catch {
+            $output  = $_.Exception.Message
+            $success = $false
+        }
+
+        if ($success) {
+            Write-Host ""
+            Write-Host "MEGAcmd CLI login appears to have succeeded." -ForegroundColor Green
+            Write-Host ""
+            Write-Host "Now let's also log you into MEGA in your browser so private links 'just work'." -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "Use the following credentials in the browser login form:" -ForegroundColor Cyan
+            Write-Host "  Email:    $email"
+            Write-Host "  Password: $plainPwd"
+            Write-Host ""
+            Write-Host "A MEGA login page will now open in your default browser." -ForegroundColor Cyan
+            Write-Host "1) Wait for the page to load." -ForegroundColor Cyan
+            Write-Host "2) Copy/paste the email & password from above into the login form." -ForegroundColor Cyan
+            Write-Host "3) Let the browser remember your login if you want." -ForegroundColor Cyan
+            Write-Host ""
+
+            Start-Process "https://mega.nz/login"
+
+            # Keep the credentials as the last thing on screen while they log in.
+            [void](Read-Host "After you've finished logging into MEGA in the browser, press Enter to continue")
+
+            # Best-effort wipe of password string after we're done.
+            $plainPwd = $null
+            return
+        }
+
+        # Login failed - clear the plain text password as soon as possible.
+        $plainPwd = $null
+
+        Write-Warning @"
+MEGAcmd login failed (attempt $attempt of $maxAttempts).
+
+Output:
+$output
+"@
+
+        if ($attempt -ge $maxAttempts) {
+            Write-Warning "Maximum login attempts reached. You can retry later manually with: mega-login"
+            return
+        }
+
+        Write-Host "What would you like to do next?" -ForegroundColor Yellow
+        Write-Host "  [R]etry with the same email"
+        Write-Host "  [C]hange email and retry"
+        Write-Host "  [S]kip / give up for now"
+        $choice = Read-Host "Choice [R/C/S] [R]"
+
+        if (-not $choice -or $choice -match '^[Rr]') {
+            # retry with same email
+            continue
+        }
+        elseif ($choice -match '^[Cc]') {
+            # change email and retry
+            $email = $null
+            continue
+        }
+        else {
+            Write-Host "Skipping MEGAcmd login for now. You can run 'mega-login' later." -ForegroundColor Yellow
+            return
+        }
+    }
+}
+
+
+function Invoke-MegaCmdExportInit {
+    # Run mega-export for the first time to accept EULA
+    Write-Host "Running 'mega-export' once to accept MEGA EULA..." -ForegroundColor Cyan
+    
+    mega-export -a ExportInit.txt
+    if ($?) {
+        Write-Host "MEGA EULA accepted successfully." -ForegroundColor Green
+        mega-export -d ExportInit.txt | Out-Null
+    }
+    else {
+        Write-Host "Failed to run 'mega-export' to accept EULA. Run 'mega-export -a ExportInit.txt' then 'mega-export -d ExportInit.txt' to avoid issues later." -ForegroundColor Red
+    }
+}
+
+
+# -----------------------------------------------------------------------------
+# One-time assetlib config (asset store root + license mode) - MEGA-focused
+# -----------------------------------------------------------------------------
+
 if (-not (Test-Path $configPath)) {
     Write-Host "Configuring asset store root URL for assetlib..." -ForegroundColor Cyan
 
-    $defaultRoot = "https://drive.google.com/drive/my-drive"
-    Write-Host "Enter the root URL of your asset store (e.g. shared Google Drive folder for all packs)."
-    Write-Host "Example: https://drive.google.com/drive/folders/<your-asset-root-folder-id>"
-    $assetRootUrl = Read-Host "Asset store root URL [$defaultRoot]"
+    $defaultRoot = "/AssetLib"
+    Write-Host "Enter the MEGA remote folder root for asset store"
+    $megaRootPath = Read-Host "Asset store root URL [$defaultRoot]"
 
-    if (-not $assetRootUrl) {
-        $assetRootUrl = $defaultRoot
+    if (-not $megaRootPath) {
+        $megaRootPath = $defaultRoot
     }
 
     $config = [pscustomobject]@{
-        assetRootUrl = $assetRootUrl
+        megaRootPath = $megaRootPath
         licenseMode  = "restrictive"  # default to safest mode
     }
 
-    # Save config as JSON
     $config |
-        ConvertTo-Json -Depth 3 |
-        Set-Content -Path $configPath -Encoding UTF8
+    ConvertTo-Json -Depth 3 |
+    Set-Content -Path $configPath -Encoding UTF8
 
-    # Docs:
-    #   ConvertTo-Json: https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/convertto-json
-    #   Set-Content   : https://learn.microsoft.com/powershell/module/microsoft.powershell.management/set-content
     Write-Host "Saved asset store root URL and license mode to assetlib.config.json" -ForegroundColor Green
 }
 else {
     Write-Host "assetlib.config.json already exists; keeping existing configuration." -ForegroundColor Yellow
 }
 
-# Define a global "assetlib" function by adding it to the user's profile.
-# This means that in any new PowerShell session, typing "assetlib" will
-# call this script with whatever arguments you pass (e.g., `assetlib list`).
-#
-# We explicitly throw a helpful error if assetlib is called with NO arguments,
-# so it fails with a clear message instead of a cryptic parameter binding error.
-# Note the use of the backtick (`) to escape `$args` inside the here-string so
-# it is not expanded when this installer runs.
-$func = @"
-function assetlib {
-    if (`$args.Count -eq 0) {
-        throw "assetlib requires a command. Run 'assetlib help' for usage."
-    }
-    & "$scriptPath" @args
-}
-"@
+# -----------------------------------------------------------------------------
+# Run MEGAcmd install (if needed), profile updates, and login wizard
+# -----------------------------------------------------------------------------
 
-# Append the function definition to the profile file.
-Add-Content -Path $PROFILE -Value $func
+Install-MegaCmdIfMissing
+Update-ProfileForAssetLibAndMega
+Invoke-MegaCmdLoginWizard
+Invoke-MegaCmdExportInit
 
-Write-Host "assetlib command installed into your PowerShell profile."
-Write-Host "Close and reopen PowerShell to start using 'assetlib'."
+Write-Host ""
+Write-Host "assetlib installation/update complete." -ForegroundColor Cyan
+Write-Host ""
+Write-Host "If you have issues with MEGAcmd or assetlib, it is recommended to:" -ForegroundColor Cyan
+Write-Host "Close and reopen PowerShell (to ensure PATH/profile changes are detected)."
+Write-Host ""
 Write-Host "Profile file used: $PROFILE"
