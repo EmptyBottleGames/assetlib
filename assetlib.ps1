@@ -439,7 +439,7 @@ function Invoke-MegaPutFolder {
 
         Write-Host "Removing existing remote folder '$RemoteFolder' via mega-rm..." -ForegroundColor Yellow
         try {
-            $outputRm = mega-rm $RemoteFolder 2>&1
+            $outputRm = mega-rm -r -f $RemoteFolder 2>&1
             if (-not $?) {
                 Write-Host $outputRm
                 throw "mega-rm failed when attempting to remove '$RemoteFolder'."
