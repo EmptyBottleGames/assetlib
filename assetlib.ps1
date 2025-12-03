@@ -273,7 +273,7 @@ function Get-AssetPackManifest {
     $returnJson = $($json | ConvertFrom-Json)
     $returnJson = if($returnJson -is [System.Array]) { $returnJson } else { @($returnJson) }
     if ($returnJson) {
-        return $returnJson
+        return if($returnJson -and -not ($returnJson -is [System.Array])) { ,$returnJson } else { if($returnJson) { $returnJson } else { , @() } }
     }
     else {
         return , @()
