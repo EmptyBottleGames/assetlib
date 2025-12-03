@@ -271,8 +271,13 @@ function Get-AssetPackManifest {
         return , @()
     }
     $returnJson = $($json | ConvertFrom-Json)
-    $returnJson = ($returnJson -is [System.Array]) ? $returnJson : @($returnJson)
-    return $returnJson ? , $returnJson : , @()
+    $returnJson = if($returnJson -is [System.Array]) { $returnJson } else { @($returnJson) }
+    if ($returnJson) {
+        return $returnJson
+    }
+    else {
+        return , @()
+    }
 }
 
 function Set-AssetPackManifest {
@@ -302,7 +307,13 @@ function Get-AssetLicenseManifest {
         return , @()
     }
     $returnJson = $json | ConvertFrom-Json
-    return $returnJson ? $returnJson : , @()
+    if ($returnJson) {
+        $returnJson = if($returnJson -is [System.Array]) { $returnJson } else { @($returnJson) }
+        return $returnJson
+    }
+    else {
+        return , @()
+    }
 }
 
 function Get-AssetPackLicenseStatus {
@@ -953,7 +964,7 @@ function Add-AssetPack {
         Write-Host "Available licenses:" -ForegroundColor Cyan
         Get-AssetLicenseList
         $licenseMode = $config.licenseMode
-        $licenseIndex = Read-Host $($licenseMode -eq "restrictive" ? "Enter the index of the license to assign to this pack" : "Enter the index of the license to assign to this pack (Leave blank for no license)")
+        $licenseIndex = Read-Host $(if ($licenseMode -eq "restrictive") { "Enter the index of the license to assign to this pack" } else { "Enter the index of the license to assign to this pack (Leave blank for no license)" })
         # Guard against invalid input
         if (-not $licenseIndex -and $licenseMode -eq 'restrictive') {
             Write-Host "In restrictive mode, a license must be assigned." -ForegroundColor Red
@@ -1018,7 +1029,7 @@ function Add-AssetPack {
     }
 
     $packTypePromptDefault = $defaultPackType
-    $packType = Read-Host "pack type (content/plugin) [$($interactivePackData.defaultPackType ? $interactivePackData.defaultPackType : $defaultPackType)]"
+    $packType = Read-Host "pack type (content/plugin) [$(if($interactivePackData.defaultPackType) { $interactivePackData.defaultPackType } else { $defaultPackType })]"
     if (-not $packType) { $packType = $packTypePromptDefault }
 
     $pluginFolderName = $null
@@ -1075,7 +1086,7 @@ function Remove-AssetPack {
     $before = $packs.Count
     $packToRemove = $packs | Where-Object { $_.id -eq $Id }
     $remaining = $packs | Where-Object { $_.id -ne $Id }
-    $remaining = ($remaining -is [System.Array]) ? $remaining : @($remaining)
+    $remaining = if($remaining -is [System.Array]) { $remaining } else { @($remaining) }
     if ($remaining.Count -eq $before) {
         Write-Error "No pack found with id: $Id"
         return
@@ -1122,7 +1133,7 @@ function Remove-AssetPack {
         }
     }
 
-    Set-AssetPackManifest -Packs $($remaining ? $remaining : , @()) 
+    Set-AssetPackManifest -Packs $(if($remaining) { $remaining } else { @() }) 
     Write-Host "Removed pack $Id from manifest." -ForegroundColor Green
 }
 
