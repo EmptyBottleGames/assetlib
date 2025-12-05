@@ -28,5 +28,18 @@
     "pluginFolderName": null,
     "engineVersion": "5.6",
     "megaSubPath": "Structures_Town_Buildings"
+  },
+  {
+    "id": "USMP_Content",
+    "name": "USMP Content",
+    "source": "Fab",
+    "categories": [],
+    "tags": [],
+    "notes": "",
+    "licenseId": "Fab_Standard_License",
+    "packType": "content",
+    "pluginFolderName": null,
+    "engineVersion": "5.7",
+    "megaSubPath": "USMP_Content"
   }
 ]
