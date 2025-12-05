@@ -1,17 +1,32 @@
-{
-  "id": "Industry_Props_Packs_6",
-  "name": "Industry Props Packs 6",
-  "source": "Fab",
-  "categories": "assets",
-  "tags": [
-    "industrial",
-    "tech",
-    "modern"
-  ],
-  "notes": "High quality props pack, for the creation industrial environment, stores, etc.",
-  "licenseId": "Fab_Standard_License",
-  "packType": "content",
-  "pluginFolderName": null,
-  "engineVersion": "5.0 - 5.6",
-  "megaSubPath": "Industry_Props_Packs_6"
-}
+[
+  {
+    "id": "Industry_Props_Packs_6",
+    "name": "Industry Props Packs 6",
+    "source": "Fab",
+    "categories": "assets",
+    "tags": [
+      "industrial",
+      "tech",
+      "modern"
+    ],
+    "notes": "High quality props pack, for the creation industrial environment, stores, etc.",
+    "licenseId": "Fab_Standard_License",
+    "packType": "content",
+    "pluginFolderName": null,
+    "engineVersion": "5.0 - 5.6",
+    "megaSubPath": "Industry_Props_Packs_6"
+  },
+  {
+    "id": "Structures_Town_Buildings",
+    "name": "Structures Town Buildings",
+    "source": "Fab",
+    "categories": "assets",
+    "tags": [],
+    "notes": "",
+    "licenseId": "Fab_Standard_License",
+    "packType": "content",
+    "pluginFolderName": null,
+    "engineVersion": "5.6",
+    "megaSubPath": "Structures_Town_Buildings"
+  }
+]
